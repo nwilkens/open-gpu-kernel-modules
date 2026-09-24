@@ -610,6 +610,10 @@ nvidia_dev_get_pci_info(const NvU8 *uuid, struct pci_dev **pci_dev_out,
     *dma_start = nvis->dma_dev.addressable_range.start;
     *dma_limit = nvis->dma_dev.addressable_range.limit;
 
+    /* nvidia-uvm binds its DMA mappings within this range. */
+    nvis->pci_dev.dev.dma_start = *dma_start;
+    nvis->pci_dev.dev.dma_limit = *dma_limit;
+
     sema_v(&nvis->ldata_lock);
     return (0);
 }

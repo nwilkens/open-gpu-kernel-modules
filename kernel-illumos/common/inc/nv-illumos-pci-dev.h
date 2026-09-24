@@ -31,8 +31,14 @@
 
 #include <sys/sunddi.h>
 
+/*
+ * dma_start and dma_limit bound the bus addresses the GPU can reach; they
+ * are set when nvidia-uvm registers the GPU.
+ */
 struct device {
     dev_info_t *dip;
+    uint64_t    dma_start;
+    uint64_t    dma_limit;
 };
 
 /* nvidia-uvm takes &pci_dev->dev for its DMA calls. */
