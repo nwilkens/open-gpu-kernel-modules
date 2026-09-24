@@ -3,7 +3,8 @@
 #
 # Builds the illumos kernel interface layer and links it with the
 # OS-agnostic nv-kernel.o and nv-modeset-kernel.o objects that the
-# top-level Makefile builds from src/.
+# top-level Makefile builds from src/.  nvidia_uvm is built from the
+# kernel-open/nvidia-uvm sources.
 #
 #   gmake                       build all modules
 #   gmake install DESTDIR=...   install into $(DESTDIR)/kernel/drv/amd64
@@ -165,9 +166,80 @@ $(OUTPUTDIR)/nvidia_i2c.kmod: $(NVIDIA_I2C_OBJS)
 	$(if $(CTFCONVERT),$(CTFCONVERT) -l $(NVIDIA_VERSION) $@)
 
 ###########################################################################
+# nvidia_uvm
+###########################################################################
+
+KOPEN_UVM       := $(NV_ROOT)/kernel-open/nvidia-uvm
+
+include $(KOPEN_UVM)/nvidia-uvm-sources.Kbuild
+
+# The tests are left out, and four sources have illumos replacements.
+NVIDIA_UVM_KOPEN_SRCS := $(filter-out %_test.c uvm_test.c uvm_test_rng.c \
+    uvm_test_file.c nv-kthread-q-selftest.c nv-kthread-q.c \
+    uvm_ats_faults.c uvm_populate_pageable.c, \
+    $(notdir $(NVIDIA_UVM_SOURCES)))
+
+# Sources that build against the Linux compatibility headers, like the
+# kernel-open ones, and sources that use illumos headers only.
+NVIDIA_UVM_KPI_SRCS := \
+    nvidia-uvm/nv_kthread_q_illumos.c \
+    nvidia-uvm/uvm_ats_faults_stub.c \
+    nvidia-uvm/uvm_illumos_bitmap.c \
+    nvidia-uvm/uvm_illumos_rbtree.c \
+    nvidia-uvm/uvm_populate_illumos.c \
+    nvidia-uvm/uvm_test_stubs.c
+
+NVIDIA_UVM_SRCS := \
+    nvidia-uvm/uvm_illumos.c \
+    nvidia-uvm/uvm_illumos_kpi.c \
+    nvidia-uvm/uvm_illumos_page.c \
+    nvidia-uvm/uvm_seg.c
+
+NVIDIA_UVM_OBJS := $(patsubst %.c,$(OUTPUTDIR)/%.o,$(NVIDIA_UVM_SRCS)) \
+                   $(patsubst nvidia-uvm/%.c,$(OUTPUTDIR)/nvidia-uvm/kpi/%.o,$(NVIDIA_UVM_KPI_SRCS)) \
+                   $(patsubst %.c,$(OUTPUTDIR)/nvidia-uvm/kopen/%.o,$(NVIDIA_UVM_KOPEN_SRCS))
+
+# The shadow tree in nvidia-uvm/lkpi supplies nv-linux.h, conftest.h and the
+# <linux/*.h> headers, so it comes before kernel-open/common/inc.
+NVIDIA_UVM_CFLAGS := $(KERNEL_CFLAGS) $(WARN_CFLAGS) \
+                     -DNVRM -DNV_KERNEL_INTERFACE_LAYER -DNV_UVM_ENABLE \
+                     -DNV_VERSION_STRING=\"$(NVIDIA_VERSION)\" \
+                     -DNVIDIA_UVM_ENABLED -DNVIDIA_UNDEF_LEGACY_BIT_MACROS \
+                     -DNV_BUILD_MODULE_INSTANCES=0 \
+                     -Invidia-uvm/lkpi -I$(COMMON_INC) -I$(KOPEN_UVM) \
+                     -Icommon/inc $(KERNEL_INC) $(EXTRA_CFLAGS)
+NVIDIA_UVM_DEPS := -Ndrv/nvidia
+
+# The compatibility header goes first, so that every UVM header sees the
+# renamed identifiers (file in particular) whatever it includes itself.
+# Kbuild also turns off -Wunused-but-set-variable.
+NVIDIA_UVM_KOPEN_CFLAGS := $(NVIDIA_UVM_CFLAGS) -Wno-unused-but-set-variable \
+                           -include uvm_illumos_kpi.h
+
+NVIDIA_UVM_HDRS := $(wildcard nvidia-uvm/*.h nvidia-uvm/lkpi/*.h \
+                   nvidia-uvm/lkpi/*/*.h common/inc/*.h)
+
+$(OUTPUTDIR)/nvidia-uvm/%.o: nvidia-uvm/%.c $(NVIDIA_UVM_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(NVIDIA_UVM_CFLAGS) -c $< -o $@
+
+$(OUTPUTDIR)/nvidia-uvm/kpi/%.o: nvidia-uvm/%.c $(NVIDIA_UVM_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(NVIDIA_UVM_KOPEN_CFLAGS) -c $< -o $@
+
+$(OUTPUTDIR)/nvidia-uvm/kopen/%.o: $(KOPEN_UVM)/%.c $(NVIDIA_UVM_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(NVIDIA_UVM_KOPEN_CFLAGS) -c $< -o $@
+
+$(OUTPUTDIR)/nvidia_uvm.kmod: $(NVIDIA_UVM_OBJS)
+	$(LD) -ztype=kmod $(NVIDIA_UVM_DEPS) -o $@ $^
+	$(if $(CTFCONVERT),$(CTFCONVERT) -l $(NVIDIA_VERSION) $@)
+
+###########################################################################
 
 MODULES         := $(OUTPUTDIR)/nvidia.kmod $(OUTPUTDIR)/nvidia_modeset.kmod \
-                   $(OUTPUTDIR)/nvidia_i2c.kmod
+                   $(OUTPUTDIR)/nvidia_i2c.kmod \
+                   $(OUTPUTDIR)/nvidia_uvm.kmod
 
 # PCI aliases for the GPUs listed as supported in the top-level README, and
 # the NVSwitch management endpoints (nvswitch_lr10_device_ids and the first
@@ -187,7 +259,7 @@ $(ALIASES): $(NV_ROOT)/README.md
 .PHONY: all objs clean install
 all: $(MODULES) $(ALIASES)
 
-objs: $(NVIDIA_OBJS) $(NVIDIA_MODESET_OBJS) $(NVIDIA_I2C_OBJS)
+objs: $(NVIDIA_OBJS) $(NVIDIA_MODESET_OBJS) $(NVIDIA_I2C_OBJS) $(NVIDIA_UVM_OBJS)
 
 clean:
 	rm -rf _out
@@ -204,3 +276,7 @@ install: all
 	    $(DESTDIR)/kernel/drv/amd64/nvidia_i2c
 	$(INSTALL) -m 0644 nvidia-i2c/nvidia_i2c.conf \
 	    $(DESTDIR)/kernel/drv/nvidia_i2c.conf
+	$(INSTALL) -m 0755 $(OUTPUTDIR)/nvidia_uvm.kmod \
+	    $(DESTDIR)/kernel/drv/amd64/nvidia_uvm
+	$(INSTALL) -m 0644 nvidia-uvm/nvidia_uvm.conf \
+	    $(DESTDIR)/kernel/drv/nvidia_uvm.conf

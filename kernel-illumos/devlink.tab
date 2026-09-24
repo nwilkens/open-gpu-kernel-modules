@@ -2,3 +2,5 @@ type=ddi_pseudo:nvidia	\M0
 type=ddi_pseudo:nvidia-caps	nvidia-caps/\M0
 type=ddi_pseudo:nvidia-caps-imex-channels	nvidia-caps-imex-channels/\M0
 type=ddi_pseudo;name=nvidia_modeset;minor=nvidia-modeset	nvidia-modeset
+type=ddi_pseudo;name=nvidia_uvm;minor=nvidia-uvm	nvidia-uvm
+type=ddi_pseudo;name=nvidia_uvm;minor=nvidia-uvm-tools	nvidia-uvm-tools

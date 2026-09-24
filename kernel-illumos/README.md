@@ -1,14 +1,16 @@
 # NVIDIA kernel modules for illumos
 
 This directory holds the illumos kernel interface layer. It is linked with the
-OS-agnostic `nv-kernel.o` and `nv-modeset-kernel.o` objects built from `src/`.
-It builds these drivers:
+OS-agnostic `nv-kernel.o` and `nv-modeset-kernel.o` objects built from `src/`,
+and, for `nvidia_uvm`, with the `kernel-open/nvidia-uvm` sources. It builds
+these drivers:
 
 | Module | Device nodes |
 | --- | --- |
 | `nvidia` | `/dev/nvidiactl`, `/dev/nvidiaN`, `/dev/nvidia-caps/*`, `/dev/nvidia-caps-imex-channels/*`, `/dev/nvidia-nvlink`, `/dev/nvidia-nvswitchctl`, `/dev/nvidia-nvswitchN` |
 | `nvidia_modeset` | `/dev/nvidia-modeset` |
 | `nvidia_i2c` | none; GPU I2C controllers in the illumos I2C framework |
+| `nvidia_uvm` | `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools` |
 
 nvidia-drm and nvidia-peermem are not built. illumos has no Linux DRM and no
 InfiniBand peer-memory interface.
@@ -32,6 +34,7 @@ to `kernel-illumos/_out/SunOS_x86_64/`.
            -i "$(tr '\n' ' ' < kernel-illumos/_out/SunOS_x86_64/nvidia.aliases)" nvidia
     add_drv -m '* 0666 root sys' nvidia_modeset
     add_drv nvidia_i2c
+    add_drv -m '* 0666 root sys' nvidia_uvm
 
 `nvidia.aliases` is generated from the supported-GPU table in the top-level
 `README.md`, plus the NVSwitch device IDs.
@@ -76,3 +79,21 @@ refused.
 A controller belongs to one attach of its GPU. If the GPU is detached and
 attached again, the controller fails all I/O until `nvidia_i2c` is detached
 and attached again.
+
+## Unified Memory
+
+`nvidia_uvm` builds the unmodified `kernel-open/nvidia-uvm` sources against a
+Linux compatibility layer in `nvidia-uvm/lkpi`. The files in `nvidia-uvm`
+supply the device, the segment driver that backs its mappings, and CPU page
+allocation. To pick up a new driver release, update `kernel-open/nvidia-uvm`
+and rebuild; source files added upstream are taken from
+`nvidia-uvm-sources.Kbuild`.
+
+UVM starts on the first open of `/dev/nvidia-uvm` after an `nvidia` instance
+has attached. Until then, opens fail with `ENXIO`.
+
+These are not supported yet: GPUs behind an IOMMU, access to pageable memory
+(HMM and ATS), tools event queues, the builtin tests, and module parameters,
+which keep their default values. Without an IOMMU, a registered GPU can reach
+all of physical memory, as on Linux. Only 64-bit processes can map
+`/dev/nvidia-uvm`.
