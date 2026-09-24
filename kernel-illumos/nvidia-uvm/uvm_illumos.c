@@ -101,6 +101,8 @@ static kt_did_t     uvm_worker_did;
 static void
 uvm_file_free(struct linux_file *f)
 {
+    if (f->f_acct != NULL)
+        uvm_acct_owner_free(f->f_acct);
     mutex_destroy(&f->f_lock);
     kmem_free(f, sizeof (*f));
     atomic_dec_uint(&uvm_file_live);
@@ -117,11 +119,24 @@ uvm_file_release_stk(void *arg)
 }
 
 static void
+uvm_file_finish(void *arg)
+{
+    struct linux_file *f = arg;
+
+    uvm_seg_file_release(f);
+    uvm_file_free(f);
+}
+
+/*
+ * uvm_release() may leave the VA space to its deferred release queue.
+ * Until that is done the VA space still has CPU chunks and allocates page
+ * tables for the file's owner, so the file and its charges go after it.
+ */
+static void
 uvm_file_release(struct linux_file *f)
 {
     uvm_stack_call(uvm_file_release_stk, f);
-    uvm_seg_file_release(f);
-    uvm_file_free(f);
+    uvm_after_deferred_release(uvm_file_finish, f);
 }
 
 void
@@ -356,6 +371,13 @@ uvm_dev_open(dev_t *devp, int flag, int otyp, cred_t *credp)
     }
 
     f = kmem_zalloc(sizeof (*f), KM_SLEEP);
+    f->f_acct = uvm_acct_owner_create(&rc);
+    if (f->f_acct == NULL) {
+        kmem_free(f, sizeof (*f));
+        ddi_soft_state_free(uvm_clone_state, (int)clone);
+        id_free(uvm_clone_ids, clone);
+        return (rc);
+    }
     mutex_init(&f->f_lock, NULL, MUTEX_DRIVER, NULL);
     f->f_op = fops;
     f->f_inode = &uvm_inode;
@@ -374,6 +396,8 @@ uvm_dev_open(dev_t *devp, int flag, int otyp, cred_t *credp)
         id_free(uvm_clone_ids, clone);
         return ((rc < 0) ? -rc : EIO);
     }
+    if (f->f_mapping != NULL)
+        f->f_mapping->am_owner = f->f_acct;
 
     mutex_enter(&uvm_files_lock);
     slot = ddi_get_soft_state(uvm_clone_state, (int)clone);

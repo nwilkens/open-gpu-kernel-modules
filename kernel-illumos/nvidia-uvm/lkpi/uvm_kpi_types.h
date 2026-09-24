@@ -246,14 +246,19 @@ struct vm_fault {
 
 /*
  * One per UVM open file.  am_segs lists the seg_nvuvm segments mapping it,
- * for unmap_mapping_range().
+ * for unmap_mapping_range().  am_owner is the file's f_acct, set after
+ * open and left alone by address_space_init_once(), which UVM runs again on
+ * the mapping of a VA space whose destruction it defers.
  */
+struct uvm_acct_owner;
+
 struct address_space {
-    struct inode       *host;
-    const void         *a_ops;
-    kmutex_t            am_lock;
-    list_t              am_segs;
-    boolean_t           am_initialized;
+    struct inode           *host;
+    const void             *a_ops;
+    kmutex_t                am_lock;
+    list_t                  am_segs;
+    boolean_t               am_initialized;
+    struct uvm_acct_owner  *am_owner;
 };
 
 struct inode {
@@ -274,6 +279,7 @@ struct linux_file {
     uint_t                          f_count;    /* open + segments + holds */
     boolean_t                       f_open;     /* between open and close */
     boolean_t                       f_poll_queued;
+    struct uvm_acct_owner          *f_acct;     /* the opener */
     struct pollhead                 f_pollhead;
     list_node_t                     f_release_link;
     list_node_t                     f_poll_link;
@@ -454,6 +460,8 @@ void    linux_cdev_del(struct cdev *);
 
 /* uvm_illumos_page.c */
 struct page *linux_alloc_pages(gfp_t, unsigned int);
+struct page *uvm_illumos_alloc_pages_owned(struct address_space *, gfp_t,
+            unsigned int);
 void    linux_free_pages(struct page *, unsigned int);
 void    linux_put_page(struct page *);
 void   *linux_page_address(struct page *);

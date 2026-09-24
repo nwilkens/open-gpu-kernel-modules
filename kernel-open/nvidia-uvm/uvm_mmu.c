@@ -123,7 +123,16 @@ static NV_STATUS phys_mem_allocate_sysmem(uvm_page_tree_t *tree, NvLength size, 
     else
         flags |= NV_UVM_GFP_FLAGS;
 
+#if defined(__illumos__)
+    // illumos has no va_space_mm, so the owner of the VA space's file is
+    // charged instead, from whatever thread this runs on.
+    if (va_space && !mm)
+        out->handle.page = uvm_illumos_alloc_pages_owned(va_space->mapping, flags, get_order(size));
+    else
+        out->handle.page = alloc_pages(flags, get_order(size));
+#else
     out->handle.page = alloc_pages(flags, get_order(size));
+#endif
 
     // va_space and mm will be set only if the memcg context has been started.
     if (mm) {

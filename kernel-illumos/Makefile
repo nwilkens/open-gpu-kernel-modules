@@ -184,6 +184,7 @@ NVIDIA_UVM_KPI_SRCS := \
     nvidia-uvm/uvm_ats_faults_stub.c \
     nvidia-uvm/uvm_illumos_bitmap.c \
     nvidia-uvm/uvm_illumos_rbtree.c \
+    nvidia-uvm/uvm_illumos_release.c \
     nvidia-uvm/uvm_populate_illumos.c
 
 NVIDIA_UVM_SRCS := \

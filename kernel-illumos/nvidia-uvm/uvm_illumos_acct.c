@@ -31,10 +31,14 @@
  * between CPU and GPU from threads that do not belong to the owner, so the
  * charge cannot follow individual pages.  Other allocations UVM marks
  * __GFP_ACCOUNT, such as semaphore pools, are charged per allocation to the
- * process whose mm is the active memcg.
+ * process whose mm is the active memcg.  User GPU page tables are charged
+ * per allocation to the owner of the VA space: the project and zone of the
+ * process that opened its file.
  *
  * A charge holds its project and zone, so it can be released from any
- * thread after the process is gone.
+ * thread after the process is gone.  Pages kept because a device may still
+ * reach them are charged to the system for good instead, since a charge
+ * that never goes away would keep its zone from halting.
  */
 
 #include "uvm_illumos.h"
@@ -61,6 +65,11 @@ struct uvm_charge {
     const void     *uc_owner;
 };
 
+struct uvm_acct_owner {
+    kproject_t     *uo_proj;
+    zone_t         *uo_zone;
+};
+
 static kmutex_t     uvm_acct_lock;
 static avl_tree_t   uvm_acct_pages;
 static list_t       uvm_acct_deferred;
@@ -77,46 +86,161 @@ uvm_acct_page_compare(const void *a, const void *b)
 }
 
 /*
- * Charge bytes of locked memory to the project and zone of the current
- * process.  Returns NULL with *errp set when a resource control denies it.
+ * Hold the project and zone of the current process, and charge bytes of
+ * locked memory to them unless bytes is 0.  Returns an errno.
  */
-uvm_charge_t *
-uvm_charge_take(size_t bytes, int *errp)
+static int
+uvm_acct_curproc(size_t bytes, kproject_t **projp, zone_t **zonep)
 {
     proc_t *p = curproc;
-    uvm_charge_t *c;
+    kproject_t *proj;
     zone_t *zone;
 
-    if (p == &p0 || p->p_as == &kas || servicing_interrupt()) {
-        *errp = EINVAL;
-        return (NULL);
-    }
-
-    c = kmem_zalloc(sizeof (*c), KM_SLEEP);
+    if (p == &p0 || p->p_as == &kas || servicing_interrupt())
+        return (EINVAL);
 
     /* A process stays in its zone while it runs this. */
     zone = p->p_zone;
     zone_hold(zone);
 
     mutex_enter(&p->p_lock);
-    if (p->p_task->tk_proj->kpj_zone != zone ||
-        rctl_incr_locked_mem(p, p->p_task->tk_proj, bytes, 0) != 0) {
+    proj = p->p_task->tk_proj;
+    if (proj->kpj_zone != zone ||
+        (bytes != 0 && rctl_incr_locked_mem(p, proj, bytes, 0) != 0)) {
         mutex_exit(&p->p_lock);
         zone_rele(zone);
-        kmem_free(c, sizeof (*c));
-        *errp = EAGAIN;
-        return (NULL);
+        return (EAGAIN);
     }
-    c->uc_proj = project_hold(p->p_task->tk_proj);
+    *projp = project_hold(proj);
     mutex_exit(&p->p_lock);
 
+    *zonep = zone;
+    return (0);
+}
+
+/*
+ * rctl_incr_locked_mem() without a process: it tests the project of the
+ * process it is given, not proj.  Both controls always deny, so their
+ * cached values are the enforced limits; their other actions are skipped.
+ */
+static int
+uvm_acct_incr(kproject_t *proj, rctl_qty_t bytes, boolean_t enforce)
+{
+    kproject_data_t *d = &proj->kpj_data;
+    zone_t *zone = proj->kpj_zone;
+    int err = 0;
+
+    mutex_enter(&zone->zone_mem_lock);
+    if (enforce &&
+        (d->kpd_locked_mem + bytes < d->kpd_locked_mem ||
+        d->kpd_locked_mem + bytes > d->kpd_locked_mem_ctl ||
+        zone->zone_locked_mem + bytes < zone->zone_locked_mem ||
+        zone->zone_locked_mem + bytes > zone->zone_locked_mem_ctl)) {
+        err = EAGAIN;
+    } else {
+        d->kpd_locked_mem += bytes;
+        zone->zone_locked_mem += bytes;
+    }
+    mutex_exit(&zone->zone_mem_lock);
+
+    return (err);
+}
+
+static uvm_charge_t *
+uvm_charge_new(kproject_t *proj, zone_t *zone, size_t bytes)
+{
+    uvm_charge_t *c = kmem_zalloc(sizeof (*c), KM_SLEEP);
+
+    c->uc_proj = proj;
     c->uc_zone = zone;
     c->uc_bytes = bytes;
     c->uc_refs = 1;
     atomic_inc_uint(&uvm_acct_live);
 
-    *errp = 0;
     return (c);
+}
+
+/*
+ * Charge bytes of locked memory to the project and zone of the current
+ * process.  Returns NULL with *errp set when a resource control denies it.
+ */
+uvm_charge_t *
+uvm_charge_take(size_t bytes, int *errp)
+{
+    kproject_t *proj;
+    zone_t *zone;
+
+    *errp = uvm_acct_curproc(bytes, &proj, &zone);
+    if (*errp != 0)
+        return (NULL);
+
+    return (uvm_charge_new(proj, zone, bytes));
+}
+
+/*
+ * Charge bytes to an owner from any thread.  A thread of the owner's
+ * project goes through rctl_incr_locked_mem(), so that the controls' other
+ * actions apply to it.
+ */
+uvm_charge_t *
+uvm_charge_take_owner(const uvm_acct_owner_t *o, size_t bytes, int *errp)
+{
+    proc_t *p = curproc;
+    kproject_t *proj = o->uo_proj;
+    boolean_t local = B_FALSE;
+    int err = 0;
+
+    if (servicing_interrupt()) {
+        *errp = EINVAL;
+        return (NULL);
+    }
+
+    if (p != &p0 && p->p_as != &kas) {
+        mutex_enter(&p->p_lock);
+        if (p->p_task->tk_proj == proj) {
+            local = B_TRUE;
+            err = rctl_incr_locked_mem(p, proj, bytes, 0);
+        }
+        mutex_exit(&p->p_lock);
+    }
+    if (!local)
+        err = uvm_acct_incr(proj, bytes, B_TRUE);
+    if (err != 0) {
+        *errp = EAGAIN;
+        return (NULL);
+    }
+
+    zone_hold(o->uo_zone);
+    *errp = 0;
+    return (uvm_charge_new(project_hold(proj), o->uo_zone, bytes));
+}
+
+uvm_acct_owner_t *
+uvm_acct_owner_create(int *errp)
+{
+    uvm_acct_owner_t *o = kmem_zalloc(sizeof (*o), KM_SLEEP);
+
+    *errp = uvm_acct_curproc(0, &o->uo_proj, &o->uo_zone);
+    if (*errp != 0) {
+        kmem_free(o, sizeof (*o));
+        return (NULL);
+    }
+    return (o);
+}
+
+void
+uvm_acct_owner_free(uvm_acct_owner_t *o)
+{
+    project_rele(o->uo_proj);
+    zone_rele(o->uo_zone);
+    kmem_free(o, sizeof (*o));
+}
+
+/* Pages that can never be freed are charged to the global zone's project 0. */
+void
+uvm_acct_quarantine(size_t bytes)
+{
+    (void) uvm_acct_incr(proj0p, bytes, B_FALSE);
 }
 
 void

@@ -40,8 +40,15 @@
  */
 typedef struct uvm_charge uvm_charge_t;
 
+/* The project and zone that opened a UVM file, held while the file lives. */
+typedef struct uvm_acct_owner uvm_acct_owner_t;
+
 /* uvm_illumos_acct.c */
 uvm_charge_t *uvm_charge_take(size_t, int *);
+uvm_charge_t *uvm_charge_take_owner(const uvm_acct_owner_t *, size_t, int *);
+uvm_acct_owner_t *uvm_acct_owner_create(int *);
+void    uvm_acct_owner_free(uvm_acct_owner_t *);
+void    uvm_acct_quarantine(size_t);
 void    uvm_charge_hold(uvm_charge_t *);
 void    uvm_charge_rele(uvm_charge_t *);
 void    uvm_charge_rele_deferred(uvm_charge_t *, const void *);

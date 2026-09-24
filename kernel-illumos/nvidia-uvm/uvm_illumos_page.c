@@ -229,6 +229,21 @@ uvm_page_alloc(vnode_t **vps, gfp_t gfp, unsigned int order)
     return (head);
 }
 
+static page_t *
+uvm_page_alloc_charged(uvm_charge_t *charge, gfp_t gfp, unsigned int order)
+{
+    page_t *head = uvm_page_alloc(uvm_page_vp[charge != NULL], gfp, order);
+
+    if (charge != NULL) {
+        if (head != NULL)
+            uvm_charge_page_add(charge, head);
+        else
+            uvm_charge_rele(charge);
+    }
+
+    return (head);
+}
+
 /*
  * __GFP_ACCOUNT allocations are charged to the process whose mm UVM made
  * the active memcg.  Managed CPU chunks (__GFP_HIGHMEM) are left out: their
@@ -239,7 +254,6 @@ struct page *
 linux_alloc_pages(gfp_t gfp, unsigned int order)
 {
     uvm_charge_t *charge = NULL;
-    page_t *head;
     void *memcg;
     int err;
 
@@ -255,15 +269,30 @@ linux_alloc_pages(gfp_t gfp, unsigned int order)
             return (NULL);
     }
 
-    head = uvm_page_alloc(uvm_page_vp[charge != NULL], gfp, order);
-    if (charge != NULL) {
-        if (head != NULL)
-            uvm_charge_page_add(charge, head);
-        else
-            uvm_charge_rele(charge);
-    }
+    return (uvm_page_alloc_charged(charge, gfp, order));
+}
 
-    return (head);
+/*
+ * User GPU page tables, from uvm_mmu.c.  UVM allocates them on any thread,
+ * even after the owner has exited, so they are charged to the owner of the
+ * VA space whose mapping m is.
+ */
+struct page *
+uvm_illumos_alloc_pages_owned(struct address_space *m, gfp_t gfp,
+    unsigned int order)
+{
+    uvm_charge_t *charge;
+    int err;
+
+    if (order > UVM_PAGE_MAX_ORDER || (gfp & __GFP_NOSLEEP) != 0 ||
+        m->am_owner == NULL)
+        return (NULL);
+
+    charge = uvm_charge_take_owner(m->am_owner, ptob(1UL << order), &err);
+    if (charge == NULL)
+        return (NULL);
+
+    return (uvm_page_alloc_charged(charge, gfp, order));
 }
 
 /* The order of an allocation from its vnode, or -1 if it is not ours. */
@@ -295,14 +324,17 @@ linux_free_pages(struct page *head, unsigned int order)
     VERIFY3S(uvm_page_order(head, &charged), ==, (int)order);
 
     npages = 1UL << order;
+    if (charged)
+        charge = uvm_charge_page_remove(head);
+
     if (!uvm_dma_may_free(head, npages)) {
         cmn_err(CE_WARN, "nvidia_uvm: keeping %lu pages a device may still "
             "reach", npages);
+        uvm_acct_quarantine(ptob(npages));
+        if (charge != NULL)
+            uvm_charge_rele(charge);
         return;
     }
-
-    if (charged)
-        charge = uvm_charge_page_remove(head);
 
     base = head->p_offset;
     for (i = 1; i < npages; i++)

@@ -82,12 +82,14 @@ and attached again.
 
 ## Unified Memory
 
-`nvidia_uvm` builds the unmodified `kernel-open/nvidia-uvm` sources against a
-Linux compatibility layer in `nvidia-uvm/lkpi`. The files in `nvidia-uvm`
-supply the device, the segment driver that backs its mappings, and CPU page
-allocation. To pick up a new driver release, update `kernel-open/nvidia-uvm`
-and rebuild; source files added upstream are taken from
-`nvidia-uvm-sources.Kbuild`.
+`nvidia_uvm` builds the `kernel-open/nvidia-uvm` sources against a Linux
+compatibility layer in `nvidia-uvm/lkpi`. The files in `nvidia-uvm` supply
+the device, the segment driver that backs its mappings, and CPU page
+allocation. The sources are unmodified except for one `__illumos__` block in
+`phys_mem_allocate_sysmem()` in `uvm_mmu.c`, which charges user GPU page
+tables to the owner of the VA space. To pick up a new driver release, update
+`kernel-open/nvidia-uvm`, carry that block forward, and rebuild; source files
+added upstream are taken from `nvidia-uvm-sources.Kbuild`.
 
 UVM starts on the first open of `/dev/nvidia-uvm` after an `nvidia` instance
 has attached. Until then, opens fail with `ENXIO`.

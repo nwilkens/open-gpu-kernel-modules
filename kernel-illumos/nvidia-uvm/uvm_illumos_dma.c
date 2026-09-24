@@ -252,22 +252,21 @@ uvm_dma_remapped(dev_info_t *dip)
         addr = uvm_dma_bind(dip, &attr, &pp[i], 1, &h, &stuck);
         if (addr == DMA_MAPPING_ERROR) {
             known = B_FALSE;
-            if (stuck) {
+            if (stuck)
                 uvm_dma_quarantine(&pp[i], 1);
-                pp[i] = NULL;
-            }
             break;
         }
         if (addr != ptob((uint64_t)pp[i]->p_pagenum))
             remap = B_TRUE;
         if (ddi_dma_unbind_handle(h) != DDI_SUCCESS) {
             uvm_dma_quarantine(&pp[i], 1);
-            pp[i] = NULL;
             known = B_FALSE;
             break;
         }
         ddi_dma_free_handle(&h);
     }
+
+    /* Quarantined pages are kept, and charged, by linux_free_pages(). */
     for (i = 0; i < 2; i++) {
         if (pp[i] != NULL)
             linux_free_pages(pp[i], 0);

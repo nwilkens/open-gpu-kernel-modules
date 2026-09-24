@@ -53,6 +53,9 @@ void    uvm_file_hold(struct linux_file *);
 void    uvm_file_rele(struct linux_file *);
 void    uvm_file_queue_pollwakeup(struct linux_file *);
 
+/* uvm_illumos_release.c */
+void    uvm_after_deferred_release(void (*)(void *), void *);
+
 /* uvm_illumos_kpi.c */
 int     uvm_kpi_init(void);
 void    uvm_kpi_fini(void);

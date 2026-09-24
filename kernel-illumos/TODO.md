@@ -34,6 +34,12 @@ Everything here builds and links, but nothing has run on a GPU yet.
   `nvidia_i2c` itself is re-attached.
 - UVM module parameters are read once at start; changing one needs a reload.
 - UVM test-file mappings do not survive fork.
+- UVM memory is charged to the process that opened `/dev/nvidia-uvm`, even
+  if the descriptor is passed to another process. Charges taken on threads
+  outside that project skip rctl syslog and signal actions (deny still
+  applies).
+- Memory kept after a failed DMA unbind is charged to the global zone's
+  project 0 and never freed.
 
 ## To report upstream
 

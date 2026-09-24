@@ -727,10 +727,14 @@ uvm_seg_capable(struct seg *seg, segcapability_t capability)
 /*
  * The Linux mm interfaces.
  */
+/* am_owner is not touched; see struct address_space. */
 void
 linux_address_space_init_once(struct address_space *m)
 {
-    bzero(m, sizeof (*m));
+    m->host = NULL;
+    m->a_ops = NULL;
+    bzero(&m->am_lock, sizeof (m->am_lock));
+    bzero(&m->am_segs, sizeof (m->am_segs));
     mutex_init(&m->am_lock, NULL, MUTEX_DRIVER, NULL);
     list_create(&m->am_segs, sizeof (uvm_seg_data_t),
         offsetof(uvm_seg_data_t, usd_link));
