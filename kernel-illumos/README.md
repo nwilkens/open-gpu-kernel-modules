@@ -2,12 +2,13 @@
 
 This directory holds the illumos kernel interface layer. It is linked with the
 OS-agnostic `nv-kernel.o` and `nv-modeset-kernel.o` objects built from `src/`.
-It builds two drivers:
+It builds these drivers:
 
 | Module | Device nodes |
 | --- | --- |
 | `nvidia` | `/dev/nvidiactl`, `/dev/nvidiaN`, `/dev/nvidia-caps/*`, `/dev/nvidia-caps-imex-channels/*`, `/dev/nvidia-nvlink`, `/dev/nvidia-nvswitchctl`, `/dev/nvidia-nvswitchN` |
 | `nvidia_modeset` | `/dev/nvidia-modeset` |
+| `nvidia_i2c` | none; GPU I2C controllers in the illumos I2C framework |
 
 nvidia-drm and nvidia-peermem are not built. illumos has no Linux DRM and no
 InfiniBand peer-memory interface.
@@ -30,6 +31,7 @@ to `kernel-illumos/_out/SunOS_x86_64/`.
         || add_drv -m '* 0666 root sys' \
            -i "$(tr '\n' ' ' < kernel-illumos/_out/SunOS_x86_64/nvidia.aliases)" nvidia
     add_drv -m '* 0666 root sys' nvidia_modeset
+    add_drv nvidia_i2c
 
 `nvidia.aliases` is generated from the supported-GPU table in the top-level
 `README.md`, plus the NVSwitch device IDs.
@@ -54,3 +56,23 @@ NVSwitch settings use the Linux parameter names `NvSwitchRegDwords` and
 
 Confidential Computing is not supported, and `RmConfidentialCompute` settings
 are ignored.
+
+## GPU I2C buses
+
+`nvidia_i2c` registers one controller per GPU with the illumos I2C framework,
+so `i2cadm` and libi2c can reach the GPU's DDC and other I2C buses. It needs an
+illumos kernel that ships the framework (`drv/i2cnex`).
+
+Each controller is named `nvgpuBBDDF` after the GPU's PCI bus, device and
+function, in hex. Its ports 0 to 15 are RM's I2C port numbers. A port carries
+I/O only while the GPU is initialized and RM exports that port.
+
+Plain reads and writes of up to 256 bytes work on every exported port. Ports
+that are not routed over DP AUX also take a one-byte write followed by a read
+with a repeated start, and SMBus quick, byte, word and block write, and I2C
+block read and write of up to 32 bytes. Other write-then-read requests are
+refused.
+
+A controller belongs to one attach of its GPU. If the GPU is detached and
+attached again, the controller fails all I/O until `nvidia_i2c` is detached
+and attached again.

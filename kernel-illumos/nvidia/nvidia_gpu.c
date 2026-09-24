@@ -119,7 +119,7 @@ nv_find_minor_locked(NvU32 minor)
     return nv_find_locked(nv_match_minor, &minor);
 }
 
-static nv_illumos_state_t *
+nv_illumos_state_t *
 nv_find_gpu_id_locked(NvU32 gpu_id)
 {
     return nv_find_locked(nv_match_gpu_id, &gpu_id);
@@ -252,6 +252,14 @@ nv_start_device(nv_state_t *nv, nvidia_stack_t *sp)
             goto failed_intr;
         nv->queue = &nvis->queue;
     }
+
+    /*
+     * RM keeps its I2C adapter table across shutdown and a full init only
+     * adds ports; a port that did not come back would stay in the table
+     * with no route, and rm_i2c_transfer() reports NV_OK for it.
+     */
+    if (!(nv->flags & NV_FLAG_PERSISTENT_SW_STATE))
+        rm_i2c_remove_adapters(sp, nv);
 
     if (!rm_init_adapter(sp, nv))
     {

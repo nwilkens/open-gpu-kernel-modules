@@ -488,6 +488,7 @@ nv_attach_gpu(dev_info_t *dip)
     rm_notify_gpu_addition(sp, nv);
 
     nvidia_modeset_probe(nvis);
+    nvidia_i2c_probe(nvis);
 
     rm_enable_dynamic_power_management(sp, nv);
 
@@ -775,6 +776,7 @@ _init(void)
     rw_init(&nv_adapter_state_lock, NULL, RW_DRIVER, NULL);
     nv_report_error_init();
     nv_modeset_interface_init();
+    nv_i2c_interface_init();
     nv_intr_init();
     nv_pm_init();
 
@@ -802,6 +804,7 @@ fail_uvm:
 fail:
     nv_pm_fini();
     nv_intr_fini();
+    nv_i2c_interface_fini();
     nv_modeset_interface_fini();
     nv_report_error_fini();
     rw_destroy(&nv_illumos_devices_lock);
@@ -828,6 +831,7 @@ _fini(void)
     nv_uvm_exit();
     nv_pm_fini();
     nv_intr_fini();
+    nv_i2c_interface_fini();
     nv_modeset_interface_fini();
     nv_report_error_fini();
     rw_destroy(&nv_illumos_devices_lock);

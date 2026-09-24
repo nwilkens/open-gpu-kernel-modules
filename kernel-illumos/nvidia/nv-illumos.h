@@ -62,6 +62,7 @@
 #include "nv-firmware.h"
 #include "nv-chardev-numbers.h"
 #include "nv-illumos-pci-dev.h"
+#include "nv-illumos-i2c.h"
 
 #define NV_ILLUMOS_DRIVER_NAME          "nvidia"
 
@@ -345,6 +346,10 @@ struct nv_illumos_state_s {
 
     NvU64                   numa_memblock_size;
 
+    /* I2C ports RM added; element N is the adapter handle for port N */
+    NvBool                  i2c_port_added[NV_I2C_NUM_PORTS];
+    NvU64                   i2c_gen;        /* set by nvidia_i2c_probe() */
+
     char                    registry_keys[512];
 };
 
@@ -374,6 +379,7 @@ int  nv_open_device(nv_state_t *, nvidia_stack_t *);
 void nv_close_device(nv_state_t *, nvidia_stack_t *);
 int  nvidia_dev_get(NvU32 gpu_id, nvidia_stack_t *sp, NvBool reset_aware);
 void nvidia_dev_put(NvU32 gpu_id, nvidia_stack_t *sp, NvBool reset_aware);
+nv_illumos_state_t *nv_find_gpu_id_locked(NvU32 gpu_id);
 #define READ_ONCE(x)            (*(volatile __typeof__(x) *)&(x))
 #define WRITE_ONCE(x, v)        (*(volatile __typeof__(x) *)&(x) = (v))
 
@@ -485,6 +491,11 @@ void nv_acpi_unregister_notifier(nv_illumos_state_t *);
 /* nvidia_modeset_interface.c */
 void nvidia_modeset_suspend(NvU32 gpu_id);
 void nvidia_modeset_resume(NvU32 gpu_id);
+
+/* nvidia_i2c_interface.c */
+void nv_i2c_interface_init(void);
+void nv_i2c_interface_fini(void);
+void nvidia_i2c_probe(nv_illumos_state_t *);
 
 /* nvidia_nvlink.c / nvidia_nvswitch.c */
 int  nvlink_drivers_init(void);

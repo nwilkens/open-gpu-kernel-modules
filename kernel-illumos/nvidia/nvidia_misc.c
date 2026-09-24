@@ -664,32 +664,3 @@ NvBool NV_API_CALL nv_pci_tegra_pm_init(nv_state_t *nv)
 void NV_API_CALL nv_pci_tegra_pm_deinit(nv_state_t *nv)
 {
 }
-
-/*
- * GPU I2C buses are not exported to the illumos I2C framework, and the
- * transfer and bus-status hooks only serve SoC display I2C.
- */
-void* NV_API_CALL nv_i2c_add_adapter(nv_state_t *nv, NvU32 port)
-{
-    return NULL;
-}
-
-void NV_API_CALL nv_i2c_del_adapter(nv_state_t *nv, void *data)
-{
-}
-
-void NV_API_CALL nv_i2c_unregister_clients(nv_state_t *nv)
-{
-}
-
-NV_STATUS NV_API_CALL nv_i2c_transfer(nv_state_t *nv, NvU32 port,
-    NvU8 address, nv_i2c_msg_t *msgs, int num_msgs)
-{
-    return NV_ERR_NOT_SUPPORTED;
-}
-
-NV_STATUS NV_API_CALL nv_i2c_bus_status(nv_state_t *nv, NvU32 port,
-    NvS32 *scl, NvS32 *sda)
-{
-    return NV_ERR_NOT_SUPPORTED;
-}

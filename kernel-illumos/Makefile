@@ -78,6 +78,7 @@ NVIDIA_SRCS     := \
     nvidia/nvidia_dma.c \
     nvidia/nvidia_fw.c \
     nvidia/nvidia_gpu.c \
+    nvidia/nvidia_i2c_interface.c \
     nvidia/nvidia_intr.c \
     nvidia/nvidia_ioctl.c \
     nvidia/nvidia_mem.c \
@@ -147,8 +148,26 @@ $(OUTPUTDIR)/nvidia_modeset.kmod: $(NVIDIA_MODESET_OBJS) $(NV_MODESET_O)
 	$(if $(CTFCONVERT),$(CTFCONVERT) -l $(NVIDIA_VERSION) $@)
 
 ###########################################################################
+# nvidia_i2c
+###########################################################################
 
-MODULES         := $(OUTPUTDIR)/nvidia.kmod $(OUTPUTDIR)/nvidia_modeset.kmod
+NVIDIA_I2C_SRCS   := nvidia-i2c/nvidia_i2c.c
+NVIDIA_I2C_OBJS   := $(patsubst %.c,$(OUTPUTDIR)/%.o,$(NVIDIA_I2C_SRCS))
+NVIDIA_I2C_CFLAGS := $(CFLAGS_BASE) -Icommon/inc
+NVIDIA_I2C_DEPS   := -Ndrv/nvidia -Ndrv/i2cnex
+
+$(OUTPUTDIR)/nvidia-i2c/%.o: nvidia-i2c/%.c common/inc/nv-illumos-i2c.h
+	@mkdir -p $(dir $@)
+	$(CC) $(NVIDIA_I2C_CFLAGS) -c $< -o $@
+
+$(OUTPUTDIR)/nvidia_i2c.kmod: $(NVIDIA_I2C_OBJS)
+	$(LD) -ztype=kmod $(NVIDIA_I2C_DEPS) -o $@ $^
+	$(if $(CTFCONVERT),$(CTFCONVERT) -l $(NVIDIA_VERSION) $@)
+
+###########################################################################
+
+MODULES         := $(OUTPUTDIR)/nvidia.kmod $(OUTPUTDIR)/nvidia_modeset.kmod \
+                   $(OUTPUTDIR)/nvidia_i2c.kmod
 
 # PCI aliases for the GPUs listed as supported in the top-level README, and
 # the NVSwitch management endpoints (nvswitch_lr10_device_ids and the first
@@ -168,7 +187,7 @@ $(ALIASES): $(NV_ROOT)/README.md
 .PHONY: all objs clean install
 all: $(MODULES) $(ALIASES)
 
-objs: $(NVIDIA_OBJS) $(NVIDIA_MODESET_OBJS)
+objs: $(NVIDIA_OBJS) $(NVIDIA_MODESET_OBJS) $(NVIDIA_I2C_OBJS)
 
 clean:
 	rm -rf _out
@@ -181,3 +200,7 @@ install: all
 	    $(DESTDIR)/kernel/drv/amd64/nvidia_modeset
 	$(INSTALL) -m 0644 nvidia-modeset/nvidia_modeset.conf \
 	    $(DESTDIR)/kernel/drv/nvidia_modeset.conf
+	$(INSTALL) -m 0755 $(OUTPUTDIR)/nvidia_i2c.kmod \
+	    $(DESTDIR)/kernel/drv/amd64/nvidia_i2c
+	$(INSTALL) -m 0644 nvidia-i2c/nvidia_i2c.conf \
+	    $(DESTDIR)/kernel/drv/nvidia_i2c.conf
