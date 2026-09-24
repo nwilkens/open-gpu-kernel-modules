@@ -29,8 +29,12 @@
 
 #define  __NO_VERSION__
 
+#if defined(__illumos__)
+#include "nv-illumos-kpi.h"
+#else
 #include "os-interface.h"
 #include "nv-linux.h"
+#endif
 
 #if defined(NV_UVM_ENABLE)
 
@@ -1119,7 +1123,7 @@ NV_STATUS nvUvmInterfaceRegisterUvmEvents(struct UvmEventsLinux *importedEvents)
 }
 EXPORT_SYMBOL(nvUvmInterfaceRegisterUvmEvents);
 
-static void flush_top_half(void *info)
+static void __attribute__((unused)) flush_top_half(void *info)
 {
     // Prior top halves on this core must have completed for this callback to
     // run at all, so we're done.
@@ -1146,7 +1150,13 @@ void nvUvmInterfaceDeRegisterUvmEvents(void)
     // Note that since we dropped the lock, another set of callbacks could have
     // already been registered. That's ok, since we just need to wait for old
     // ones to finish.
+#if defined(__illumos__)
+    // Top halves run in interrupt threads that can block, so a cross call
+    // does not prove they finished; wait on each GPU's ISR lock instead.
+    nv_drain_isr_top_halves();
+#else
     on_each_cpu(flush_top_half, NULL, 1);
+#endif
 }
 EXPORT_SYMBOL(nvUvmInterfaceDeRegisterUvmEvents);
 

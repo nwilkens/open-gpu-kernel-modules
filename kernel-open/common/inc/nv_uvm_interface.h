@@ -36,6 +36,12 @@ struct UvmEventsLinux;
 // We are in the UVM build system, for a Linux target.
 #include "uvm_linux.h"
 
+#elif defined(__illumos__)
+
+// We are in the RM build system, for an illumos target:
+#include "nv-illumos-kpi.h"
+#include "nv-illumos-pci-dev.h"
+
 #else
 
 // We are in the RM build system, for a Linux target:
