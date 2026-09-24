@@ -166,7 +166,10 @@ ifeq ($(TARGET_ARCH),x86_64)
   CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -fno-jump-tables)
   CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mindirect-branch=thunk-extern)
   CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mindirect-branch-register)
-  CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mfunction-return=thunk-extern)
+  # The illumos kernel provides indirect branch thunks but no return thunk.
+  ifneq ($(TARGET_OS),SunOS)
+    CONDITIONAL_CFLAGS += $(call TEST_CC_ARG, -mfunction-return=thunk-extern)
+  endif
 endif
 
 CFLAGS += $(CONDITIONAL_CFLAGS)
