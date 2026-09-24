@@ -68,20 +68,114 @@ nv_power_management(nv_state_t *nv, nv_pm_action_t pm_action)
 }
 
 /*
- * DDI suspends GPUs one at a time.  NVKMS and UVM are quiesced once, before
- * the first GPU suspends, and resumed after the last one resumes, the way
- * the Linux system suspend path brackets its per-GPU suspends.
+ * UVM expects user channels to be stopped before it suspends, so they cannot
+ * stall on faults it is about to discard.  Called with ldata_lock held.
+ */
+static NV_STATUS
+nv_preempt_user_channels(nv_illumos_state_t *nvis, nvidia_stack_t *sp)
+{
+    nv_state_t *nv = NV_STATE_PTR(nvis);
+    NV_STATUS status;
+
+    if ((nv->flags & NV_FLAG_INITIALIZED) == 0)
+        return NV_OK;
+
+    status = rm_ref_dynamic_power(sp, nv, NV_DYNAMIC_PM_FINE);
+    if (status != NV_OK)
+        return status;
+
+    sema_p(&nvis->mmap_lock);
+    nv_set_safe_to_mmap_locked(nv, NV_FALSE);
+    nv_revoke_mappings_locked(nvis);
+    sema_v(&nvis->mmap_lock);
+
+    nvis->channels_preempted = NV_TRUE;
+
+    return rm_stop_user_channels(sp, nv);
+}
+
+static void
+nv_restore_user_channels(nv_illumos_state_t *nvis, nvidia_stack_t *sp)
+{
+    nv_state_t *nv = NV_STATE_PTR(nvis);
+
+    if (!nvis->channels_preempted)
+        return;
+    nvis->channels_preempted = NV_FALSE;
+
+    if (rm_restart_user_channels(sp, nv) != NV_OK)
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "failed to restart user channels\n");
+
+    sema_p(&nvis->mmap_lock);
+    nv_set_safe_to_mmap_locked(nv, NV_TRUE);
+    sema_v(&nvis->mmap_lock);
+
+    rm_unref_dynamic_power(sp, nv, NV_DYNAMIC_PM_FINE);
+}
+
+static void
+nv_restore_all_user_channels(nvidia_stack_t *sp)
+{
+    nv_illumos_state_t *nvis;
+
+    rw_enter(&nv_illumos_devices_lock, RW_READER);
+    for (nvis = nv_illumos_devices; nvis != NULL; nvis = nvis->next)
+    {
+        sema_p(&nvis->ldata_lock);
+        nv_restore_user_channels(nvis, sp);
+        sema_v(&nvis->ldata_lock);
+    }
+    rw_exit(&nv_illumos_devices_lock);
+}
+
+static NV_STATUS
+nv_preempt_all_user_channels(nvidia_stack_t *sp)
+{
+    nv_illumos_state_t *nvis;
+    NV_STATUS status = NV_OK;
+
+    rw_enter(&nv_illumos_devices_lock, RW_READER);
+    for (nvis = nv_illumos_devices; nvis != NULL && status == NV_OK;
+         nvis = nvis->next)
+    {
+        sema_p(&nvis->ldata_lock);
+        status = nv_preempt_user_channels(nvis, sp);
+        sema_v(&nvis->ldata_lock);
+    }
+    rw_exit(&nv_illumos_devices_lock);
+
+    if (status != NV_OK)
+        nv_restore_all_user_channels(sp);
+
+    return status;
+}
+
+/*
+ * DDI suspends GPUs one at a time.  User channels, NVKMS and UVM are
+ * quiesced once, before the first GPU suspends, and resumed after the last
+ * one resumes, the way the Linux system suspend path brackets its per-GPU
+ * suspends.
  */
 static NV_STATUS
 nv_system_suspend_hold(void)
 {
+    nvidia_stack_t *sp = NULL;
     NV_STATUS status = NV_OK;
+
+    if (nv_stack_alloc(&sp) != 0)
+        return NV_ERR_NO_MEMORY;
 
     mutex_enter(&nv_pm_lock);
     if (nv_suspended_gpus == 0)
     {
         nvidia_modeset_suspend(0);
-        status = nv_uvm_suspend();
+        status = nv_preempt_all_user_channels(sp);
+        if (status == NV_OK)
+        {
+            status = nv_uvm_suspend();
+            if (status != NV_OK)
+                nv_restore_all_user_channels(sp);
+        }
         if (status != NV_OK)
             nvidia_modeset_resume(0);
     }
@@ -89,19 +183,31 @@ nv_system_suspend_hold(void)
         nv_suspended_gpus++;
     mutex_exit(&nv_pm_lock);
 
+    nv_stack_free(sp);
     return status;
 }
 
 static void
 nv_system_suspend_rele(void)
 {
+    nvidia_stack_t *sp = NULL;
+
+    /* Resume cannot be refused; without a stack, channels stay stopped. */
+    (void) nv_stack_alloc(&sp);
+
     mutex_enter(&nv_pm_lock);
     if (nv_suspended_gpus > 0 && --nv_suspended_gpus == 0)
     {
-        (void) nv_uvm_resume();
+        if (nv_uvm_resume() != NV_OK)
+            nv_printf(NV_DBG_ERRORS, "NVRM: UVM resume failed\n");
+        if (sp != NULL)
+            nv_restore_all_user_channels(sp);
         nvidia_modeset_resume(0);
     }
     mutex_exit(&nv_pm_lock);
+
+    if (sp != NULL)
+        nv_stack_free(sp);
 }
 
 int
@@ -186,6 +292,10 @@ nv_resume_gpu(nv_illumos_state_t *nvis)
     {
         nvidia_modeset_resume(nv->gpu_id);
         nv->flags &= ~NV_FLAG_SUSPENDED;
+    }
+    else
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv, "resume failed: 0x%x\n", status);
     }
 
 done:

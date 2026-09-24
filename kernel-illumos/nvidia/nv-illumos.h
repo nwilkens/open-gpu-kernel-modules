@@ -336,6 +336,7 @@ struct nv_illumos_state_s {
     ksema_t                 mmap_lock;
     list_t                  open_files;
     NvBool                  all_mappings_revoked;
+    NvBool                  channels_preempted;    /* nvidia_pm.c */
     NvBool                  safe_to_mmap;
     NvBool                  gpu_wakeup_callback_needed;
 
