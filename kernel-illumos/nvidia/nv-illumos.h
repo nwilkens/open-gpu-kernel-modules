@@ -368,6 +368,7 @@ extern uint_t               nv_intr_pri;
 extern NvU32                cur_debuglevel;
 
 /* nvidia_ddi.c */
+NvBool nv_rm_is_initialized(void);
 nv_illumos_state_t *nv_find_minor(NvU32 minor);
 nv_illumos_state_t *nv_find_minor_locked(NvU32 minor);
 int  nv_dev_alloc_stacks(nv_illumos_state_t *);

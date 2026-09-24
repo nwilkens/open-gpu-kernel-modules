@@ -230,6 +230,22 @@ nv_global_fini(void)
     nv_rm_initialized = NV_FALSE;
 }
 
+/*
+ * RM starts when the first nvidia instance attaches, not at _init, so
+ * nvidia-uvm checks this before it calls into RM.
+ */
+NvBool
+nv_rm_is_initialized(void)
+{
+    NvBool ret;
+
+    mutex_enter(&nv_global_lock);
+    ret = nv_rm_initialized;
+    mutex_exit(&nv_global_lock);
+
+    return (ret);
+}
+
 static NvBool
 nv_dip_is_pseudo(dev_info_t *dip)
 {
@@ -350,6 +366,7 @@ nv_attach_gpu(dev_info_t *dip)
 
     nvis->dip = dip;
     nvis->pci_dev.dip = dip;
+    nvis->pci_dev.dev.dip = dip;
     nvis->instance = ddi_get_instance(dip);
     nvis->pci_cfg = cfg;
     (void) memcpy(nv->cached_gpu_info.vbios_version, "??.??.??.??.??", 15);

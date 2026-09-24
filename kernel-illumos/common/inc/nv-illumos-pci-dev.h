@@ -31,8 +31,14 @@
 
 #include <sys/sunddi.h>
 
+struct device {
+    dev_info_t *dip;
+};
+
+/* nvidia-uvm takes &pci_dev->dev for its DMA calls. */
 struct pci_dev {
     dev_info_t *dip;
+    struct device dev;
 };
 
 #endif /* _NV_ILLUMOS_PCI_DEV_H_ */
