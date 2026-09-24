@@ -384,9 +384,13 @@ linux_dma_unmap_page(struct device *dev, dma_addr_t addr, size_t size)
     uvm_dma_map_t key, *m;
     avl_index_t where;
 
-    if (dev == NULL || dev->dip == NULL || !uvm_dma_remapped(dev->dip))
+    if (dev == NULL || dev->dip == NULL)
         return;
 
+    /*
+     * The mapping table, not a fresh probe, says whether addr was bound:
+     * the probe can answer differently than it did at map time.
+     */
     key.udm_dip = dev->dip;
     key.udm_addr = addr;
     key.udm_seq = 0;
@@ -398,8 +402,10 @@ linux_dma_unmap_page(struct device *dev, dma_addr_t addr, size_t size)
     if (m == NULL || m->udm_dip != dev->dip || m->udm_addr != addr ||
         m->udm_size != size) {
         mutex_exit(&uvm_dma_map_lock);
-        dev_err(dev->dip, CE_WARN, "nvidia_uvm: unmap of an unknown DMA "
-            "mapping 0x%llx size 0x%lx", (u_longlong_t)addr, size);
+        if (uvm_dma_remapped(dev->dip)) {
+            dev_err(dev->dip, CE_WARN, "nvidia_uvm: unmap of an unknown "
+                "DMA mapping 0x%llx size 0x%lx", (u_longlong_t)addr, size);
+        }
         return;
     }
     avl_remove(&uvm_dma_maps, m);
