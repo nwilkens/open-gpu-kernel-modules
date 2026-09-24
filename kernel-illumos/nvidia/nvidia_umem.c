@@ -44,8 +44,8 @@
 /*
  * User memory pinning.  umem_lockmemory(DDI_UMEMLOCK_LONGTERM) keeps the
  * pages locked beyond the ioctl and enforces locked-memory resource
- * controls.  Physical addresses are read through the process HAT while the
- * pages are locked.
+ * controls.  Physical addresses come from the pagelock's shadow list, or from
+ * the process HAT when the segment softlocked the range instead.
  */
 typedef struct nv_user_pages_s {
     ddi_umem_cookie_t   cookie;
@@ -55,14 +55,15 @@ typedef struct nv_user_pages_s {
     NvU64              *phys;
 } nv_user_pages_t;
 
+/*
+ * munmap(2) or exit of a range RM still has pinned.  The pin cannot be
+ * dropped here: the GPU may still DMA to these pages, and RM has no way to
+ * revoke that.  The unmap waits until RM unpins, when the memory object is
+ * freed.
+ */
 static void
 nv_umem_lock_cleanup(ddi_umem_cookie_t *cookie)
 {
-    /*
-     * Called if the address space goes away while RM still holds the pin
-     * (an fd shared with a surviving process).  RM releases the pin when its
-     * owning object is freed, as with pinned pages on Linux.
-     */
 }
 
 static struct umem_callback_ops nv_umem_callbacks = {
@@ -80,6 +81,7 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
     nv_user_pages_t *up;
     caddr_t addr = (caddr_t)((uintptr_t)address & MMU_PAGEMASK);
     int lflags = DDI_UMEMLOCK_READ | DDI_UMEMLOCK_LONGTERM;
+    page_t **pparray;
     NvU64 i;
     int err;
 
@@ -116,9 +118,12 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
         return NV_ERR_INVALID_ADDRESS;
     }
 
+    pparray = ((struct ddi_umem_cookie *)up->cookie)->pparray;
+
     for (i = 0; i < page_count; i++)
     {
-        pfn_t pfn = hat_getpfnum(curproc->p_as->a_hat, addr + mmu_ptob(i));
+        pfn_t pfn = (pparray != NULL) ? page_pptonum(pparray[i]) :
+            hat_getpfnum(curproc->p_as->a_hat, addr + mmu_ptob(i));
 
         if (pfn == PFN_INVALID)
         {
