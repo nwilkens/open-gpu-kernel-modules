@@ -247,7 +247,9 @@ nvlink_is_admin(void)
 }
 
 /*
- * /dev/nvidia-nvlink.  Opens are exclusive, as on Linux.
+ * /dev/nvidia-nvlink.  Opens are exclusive, as on Linux.  Only privileged
+ * callers may open it, so an ordinary user cannot hold the node and lock
+ * out the fabric manager.
  */
 int
 nvlink_node_open(nv_illumos_file_private_t *nvifp, cred_t *credp)
@@ -258,6 +260,9 @@ nvlink_node_open(nv_illumos_file_private_t *nvifp, cred_t *credp)
 
     if (!nvlink_drvctx.initialized)
         return (ENXIO);
+
+    if (drv_priv(credp) != 0)
+        return (EPERM);
 
     mutex_enter(&nvlink_drvctx.lock);
 
