@@ -85,13 +85,26 @@ static inline unsigned long copy_to_user(void *to, const void *from,
 #define S_IRUGO                 0444
 #define S_IWUSR                 0200
 
-/* Tunables keep their defaults. */
+/*
+ * Module parameters are set from driver properties by uvm_illumos_params.c,
+ * which finds each one through nv_uvm_param_<name>.
+ */
+#define LINUX_PARAM_TYPEOF(name, type, lo, hi)                              \
+    LINUX_PARAM_TYPEOF_##name = LINUX_PARAM_TYPE_##type,
+enum { UVM_PARAMS(LINUX_PARAM_TYPEOF) };
+
+#define LINUX_PARAM_FITS_int(v)     (sizeof (v) == sizeof (int))
+#define LINUX_PARAM_FITS_uint(v)    (sizeof (v) == sizeof (unsigned int))
+#define LINUX_PARAM_FITS_ulong(v)   (sizeof (v) == sizeof (unsigned long))
+#define LINUX_PARAM_FITS_bool(v)    __same_type(v, bool)
+#define LINUX_PARAM_FITS_charp(v)   __same_type(v, char *)
+
 #define module_param(name, type, perm)                                      \
-    static const void *__module_param_##name __attribute__((unused)) = &(name)
-#define module_param_named(name, var, type, perm)                           \
-    module_param(var, type, perm)
-#define module_param_string(name, str, len, perm)                           \
-    module_param(str, charp, perm)
+    _Static_assert((int)LINUX_PARAM_TYPEOF_##name == LINUX_PARAM_TYPE_##type, \
+        "module_param " #name " is not in uvm_kpi_params.h as " #type);    \
+    _Static_assert(LINUX_PARAM_FITS_##type(name),                           \
+        "module_param " #name " does not have type " #type);               \
+    const struct linux_param_var nv_uvm_param_##name = { (void *)&(name) }
 #define MODULE_PARM_DESC(name, desc)
 #define MODULE_LICENSE(s)
 #define MODULE_INFO(tag, s)
@@ -103,6 +116,10 @@ static inline unsigned long copy_to_user(void *to, const void *from,
 #define EXPORT_SYMBOL(sym)
 #define EXPORT_SYMBOL_GPL(sym)
 #define THIS_MODULE             ((struct module *)NULL)
+
+/* UVM suspend and resume run on a thread of their own; see uvm_illumos_pm.c. */
+#define nvUvmInterfaceRegisterUvmEvents     uvm_illumos_register_uvm_events
+#define nvUvmInterfaceDeRegisterUvmEvents   uvm_illumos_deregister_uvm_events
 
 /* module_init/module_exit name the entry points for the illumos driver. */
 #define module_init(fn)                                                     \

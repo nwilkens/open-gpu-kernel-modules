@@ -173,11 +173,9 @@ KOPEN_UVM       := $(NV_ROOT)/kernel-open/nvidia-uvm
 
 include $(KOPEN_UVM)/nvidia-uvm-sources.Kbuild
 
-# The tests are left out, and four sources have illumos replacements.
-NVIDIA_UVM_KOPEN_SRCS := $(filter-out %_test.c uvm_test.c uvm_test_rng.c \
-    uvm_test_file.c nv-kthread-q-selftest.c nv-kthread-q.c \
-    uvm_ats_faults.c uvm_populate_pageable.c, \
-    $(notdir $(NVIDIA_UVM_SOURCES)))
+# Three sources have illumos replacements.
+NVIDIA_UVM_KOPEN_SRCS := $(filter-out nv-kthread-q.c uvm_ats_faults.c \
+    uvm_populate_pageable.c, $(notdir $(NVIDIA_UVM_SOURCES)))
 
 # Sources that build against the Linux compatibility headers, like the
 # kernel-open ones, and sources that use illumos headers only.
@@ -186,13 +184,19 @@ NVIDIA_UVM_KPI_SRCS := \
     nvidia-uvm/uvm_ats_faults_stub.c \
     nvidia-uvm/uvm_illumos_bitmap.c \
     nvidia-uvm/uvm_illumos_rbtree.c \
-    nvidia-uvm/uvm_populate_illumos.c \
-    nvidia-uvm/uvm_test_stubs.c
+    nvidia-uvm/uvm_populate_illumos.c
 
 NVIDIA_UVM_SRCS := \
     nvidia-uvm/uvm_illumos.c \
     nvidia-uvm/uvm_illumos_kpi.c \
+    nvidia-uvm/uvm_illumos_acct.c \
+    nvidia-uvm/uvm_illumos_dma.c \
     nvidia-uvm/uvm_illumos_page.c \
+    nvidia-uvm/uvm_illumos_pin.c \
+    nvidia-uvm/uvm_illumos_params.c \
+    nvidia-uvm/uvm_illumos_pm.c \
+    nvidia-uvm/uvm_illumos_stack.c \
+    nvidia-uvm/uvm_illumos_test.c \
     nvidia-uvm/uvm_seg.c
 
 NVIDIA_UVM_OBJS := $(patsubst %.c,$(OUTPUTDIR)/%.o,$(NVIDIA_UVM_SRCS)) \

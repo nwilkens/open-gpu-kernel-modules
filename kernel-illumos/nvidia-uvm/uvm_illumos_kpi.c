@@ -55,14 +55,38 @@ static struct task_struct linux_intr_task = {
     .comm = "interrupt",
 };
 
+void
+linux_task_destroy(struct task_struct *t)
+{
+    if (t->shadow_vma != NULL)
+        kmem_free(t->shadow_vma, sizeof (struct vm_area_struct));
+    kmem_free(t, sizeof (*t));
+}
+
+/* The TSD destructor; kthread_stop() frees the task of a kthread. */
 static void
 linux_task_free(void *arg)
 {
     struct task_struct *t = arg;
 
-    if (t->shadow_vma != NULL)
-        kmem_free(t->shadow_vma, sizeof (struct vm_area_struct));
-    kmem_free(t, sizeof (*t));
+    if (t->kthread == NULL)
+        linux_task_destroy(t);
+}
+
+/* Makes t the current task of a thread that has none. */
+void
+linux_task_adopt(struct task_struct *t)
+{
+    VERIFY3P(tsd_get(linux_task_key), ==, NULL);
+    t->thread = curthread;
+    t->did = curthread->t_did;
+    VERIFY0(tsd_set(linux_task_key, t));
+}
+
+void
+linux_task_disown(void)
+{
+    VERIFY0(tsd_set(linux_task_key, NULL));
 }
 
 struct task_struct *
@@ -86,6 +110,7 @@ linux_current(void)
     t->pid = (pid_t)curthread->t_did;
     t->tgid = p->p_pid;
     t->flags = (p == &p0) ? PF_KTHREAD : 0;
+    t->stack = curthread->t_stkbase;
     (void) strlcpy(t->comm, PTOU(p)->u_comm, sizeof (t->comm));
 
     return (t);

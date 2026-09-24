@@ -34,9 +34,6 @@
 
 #define UVM_ILLUMOS_NAME        "nvidia_uvm"
 
-/* UVM threads run RM calls on their own stack; see the design notes. */
-#define UVM_THREAD_STACK_SIZE   (64 * 1024)
-
 /* Base minors, as in kernel-open/nvidia-uvm/uvm_common.h. */
 #define UVM_NODE_UVM            0
 #define UVM_NODE_TOOLS          1
@@ -60,6 +57,23 @@ void    uvm_file_queue_pollwakeup(struct linux_file *);
 int     uvm_kpi_init(void);
 void    uvm_kpi_fini(void);
 kthread_t *uvm_thread_create(void (*)(void *), void *);
+
+/* uvm_illumos_params.c */
+void    uvm_params_init(void);
+void    uvm_params_apply(dev_info_t *);
+void    uvm_params_fini(void);
+
+/* uvm_illumos_pm.c */
+void    uvm_pm_init(void);
+void    uvm_pm_fini(void);
+boolean_t uvm_pm_is_suspended(void);
+
+/* uvm_illumos_stack.c */
+void    uvm_stack_call(void (*)(void *), void *);
+vm_fault_t uvm_fault_call(vm_fault_t (*)(struct vm_fault *), struct vm_fault *);
+void    uvm_vma_op_call(void (*)(struct vm_area_struct *),
+            struct vm_area_struct *);
+boolean_t uvm_stack_split_supported(void);
 
 /* uvm_illumos_page.c */
 int     uvm_page_init(void);

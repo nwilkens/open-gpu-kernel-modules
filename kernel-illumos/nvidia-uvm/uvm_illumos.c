@@ -35,6 +35,7 @@
  */
 
 #include "uvm_illumos.h"
+#include "uvm_illumos_mem.h"
 #include "uvm_seg.h"
 
 #include <sys/stat.h>
@@ -46,11 +47,15 @@
 #include <sys/id_space.h>
 #include <sys/vnode.h>
 #include <sys/model.h>
+#include <sys/policy.h>
 
 #include "nvtypes.h"
 
 /* nvidia.kmod */
 extern NvBool nv_rm_is_initialized(void);
+
+/* kernel-open/nvidia-uvm/uvm_common.c */
+extern int uvm_enable_builtin_tests;
 
 /* kernel-open/nvidia-uvm/uvm.c, through the module_init/exit macros */
 extern int nv_uvm_module_init(void);
@@ -101,11 +106,21 @@ uvm_file_free(struct linux_file *f)
     atomic_dec_uint(&uvm_file_live);
 }
 
+/* Tearing down a VA space frees GPU memory through RM. */
+static void
+uvm_file_release_stk(void *arg)
+{
+    struct linux_file *f = arg;
+
+    if (f->f_op->release != NULL)
+        (void) f->f_op->release(f->f_inode, f);
+}
+
 static void
 uvm_file_release(struct linux_file *f)
 {
-    if (f->f_op->release != NULL)
-        (void) f->f_op->release(f->f_inode, f);
+    uvm_stack_call(uvm_file_release_stk, f);
+    uvm_seg_file_release(f);
     uvm_file_free(f);
 }
 
@@ -220,6 +235,12 @@ uvm_worker_main(void *arg)
     thread_exit();
 }
 
+static void
+uvm_module_init_stk(void *arg)
+{
+    *(int *)arg = nv_uvm_module_init();
+}
+
 /* Start UVM once RM is up; a failed start is retried by the next open. */
 static int
 uvm_start(void)
@@ -228,10 +249,11 @@ uvm_start(void)
 
     mutex_enter(&uvm_start_lock);
     if (!uvm_started) {
-        if (!nv_rm_is_initialized()) {
+        if (!nv_rm_is_initialized() || uvm_illumos_dip == NULL) {
             rc = ENXIO;
         } else {
-            rc = nv_uvm_module_init();
+            uvm_params_apply(uvm_illumos_dip);
+            uvm_stack_call(uvm_module_init_stk, &rc);
             if (rc == 0)
                 uvm_started = B_TRUE;
             else
@@ -401,12 +423,30 @@ uvm_dev_close(dev_t dev, int flag, int otyp, cred_t *credp)
     return (0);
 }
 
+typedef struct uvm_ioctl_baton {
+    long              (*uib_ioctl)(struct linux_file *, unsigned int,
+                          unsigned long);
+    struct linux_file  *uib_file;
+    unsigned int        uib_cmd;
+    unsigned long       uib_arg;
+    long                uib_ret;
+} uvm_ioctl_baton_t;
+
+static void
+uvm_dev_ioctl_stk(void *arg)
+{
+    uvm_ioctl_baton_t *b = arg;
+
+    b->uib_ret = b->uib_ioctl(b->uib_file, b->uib_cmd, b->uib_arg);
+}
+
 static int
 uvm_dev_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
     int *rvalp)
 {
     long (*ioctl)(struct linux_file *, unsigned int, unsigned long);
     struct linux_file *f;
+    uvm_ioctl_baton_t b;
     long ret;
 
     /* UVM copies parameters with copyin() and copyout(). */
@@ -417,13 +457,32 @@ uvm_dev_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
     if (f == NULL)
         return (ENXIO);
 
+    /*
+     * With the builtin tests enabled, the test ioctls and the test flags of
+     * regular ones (UVM_MIGRATE, UVM_POPULATE_PAGEABLE) can expose kernel
+     * state, so every ioctl needs sys_config.
+     */
+    if (uvm_enable_builtin_tests != 0 &&
+        secpolicy_sys_config(credp, B_FALSE) != 0) {
+        uvm_file_rele(f);
+        return (EPERM);
+    }
+
     if (ddi_model_convert_from(mode & FMODELS) == DDI_MODEL_NONE)
         ioctl = f->f_op->unlocked_ioctl;
     else
         ioctl = f->f_op->compat_ioctl;
 
-    ret = (ioctl != NULL) ? ioctl(f, (unsigned int)cmd, (unsigned long)arg) :
-        -ENOTTY;
+    if (ioctl != NULL) {
+        b.uib_ioctl = ioctl;
+        b.uib_file = f;
+        b.uib_cmd = (unsigned int)cmd;
+        b.uib_arg = (unsigned long)arg;
+        uvm_stack_call(uvm_dev_ioctl_stk, &b);
+        ret = b.uib_ret;
+    } else {
+        ret = -ENOTTY;
+    }
 
     uvm_file_rele(f);
 
@@ -432,6 +491,22 @@ uvm_dev_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 
     *rvalp = (int)ret;
     return (0);
+}
+
+/*
+ * The ioctl rule for the builtin tests, for mmap of a test file passed to
+ * another process.  credp is the opener's, so check the caller's.
+ */
+static int
+uvm_dev_segmap(dev_t dev, off_t off, struct as *as, caddr_t *addrp,
+    off_t len, uint_t prot, uint_t maxprot, uint_t flags, cred_t *credp)
+{
+    if (uvm_enable_builtin_tests != 0 &&
+        secpolicy_sys_config(CRED(), B_FALSE) != 0)
+        return (EPERM);
+
+    return (uvm_seg_segmap(dev, off, as, addrp, len, prot, maxprot, flags,
+        credp));
 }
 
 static int
@@ -509,6 +584,11 @@ uvm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
     uvm_illumos_dip = dip;
     ddi_report_dev(dip);
 
+    if (!uvm_stack_split_supported()) {
+        cmn_err(CE_WARN, "%s: no thread_splitstack(); UVM faults and "
+            "ioctls run on the caller's stack", UVM_ILLUMOS_NAME);
+    }
+
     return (DDI_SUCCESS);
 }
 
@@ -541,7 +621,7 @@ static struct cb_ops uvm_cb_ops = {
     .cb_ioctl       = uvm_dev_ioctl,
     .cb_devmap      = nodev,
     .cb_mmap        = nodev,
-    .cb_segmap      = uvm_seg_segmap,
+    .cb_segmap      = uvm_dev_segmap,
     .cb_chpoll      = uvm_dev_chpoll,
     .cb_prop_op     = ddi_prop_op,
     .cb_str         = NULL,
@@ -605,6 +685,8 @@ _init(void)
 {
     int rc;
 
+    uvm_params_init();
+
     rc = ddi_soft_state_init(&uvm_clone_state, sizeof (uvm_clone_t), 0);
     if (rc != 0)
         return (rc);
@@ -631,6 +713,7 @@ _init(void)
         goto fail_kpi;
 
     uvm_worker_did = uvm_thread_create(uvm_worker_main, NULL)->t_did;
+    uvm_pm_init();
 
     rc = mod_install(&uvm_modlinkage);
     if (rc != 0)
@@ -639,6 +722,7 @@ _init(void)
     return (0);
 
 fail_worker:
+    uvm_pm_fini();
     uvm_worker_stop();
     uvm_page_fini();
 fail_kpi:
@@ -653,8 +737,9 @@ _fini(void)
 {
     int rc;
 
-    /* Files and segments call into this module. */
-    if (uvm_file_live != 0 || uvm_seg_count() != 0)
+    /* Files and segments call into this module; suspend holds UVM locks. */
+    if (uvm_file_live != 0 || uvm_seg_count() != 0 || uvm_pin_busy() ||
+        uvm_pm_is_suspended())
         return (EBUSY);
 
     rc = mod_remove(&uvm_modlinkage);
@@ -666,10 +751,12 @@ _fini(void)
         uvm_started = B_FALSE;
     }
 
+    uvm_pm_fini();
     uvm_worker_stop();
     uvm_page_fini();
     uvm_kpi_fini();
     uvm_globals_fini();
+    uvm_params_fini();
 
     return (0);
 }

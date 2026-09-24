@@ -45,6 +45,7 @@
 #include <sys/semaphore.h>
 #include <sys/atomic.h>
 #include <sys/list.h>
+#include <sys/avl.h>
 #include <sys/poll.h>
 #include <sys/mman.h>
 #include <sys/thread.h>
@@ -62,6 +63,10 @@
 
 #include "nv-illumos-pci-dev.h"
 #include "kpi/uvm_kpi_const.h"
+#include "uvm_kpi_params.h"
+
+/* UVM threads and split stacks, for UVM paths that reach RM. */
+#define UVM_THREAD_STACK_SIZE   (64 * 1024)
 
 /* The Linux 64-bit types are long long, as NvU64 is. */
 typedef unsigned char           u8;
@@ -194,7 +199,9 @@ struct task_struct {
     char                comm[MAXCOMLEN + 1];
     kthread_t          *thread;
     kt_did_t            did;
+    void               *stack;
     struct vm_area_struct *shadow_vma;  /* find_vma() of foreign segments */
+    struct linux_kthread *kthread;      /* from kthread_run() */
 };
 
 #define PF_KTHREAD              0x00200000
@@ -357,7 +364,15 @@ struct sg_dma_page_iter {
     struct sg_page_iter base;
 };
 
-struct radix_tree_root { void *rnode; };
+/* Radix trees are AVL trees keyed by index, for the builtin tests. */
+struct radix_tree_root {
+    avl_tree_t      rt_tree;
+    gfp_t           rt_gfp;
+};
+
+struct radix_tree_iter {
+    unsigned long   index;
+};
 
 struct ratelimit_state {
     hrtime_t        begin;
@@ -408,6 +423,27 @@ void    linux_wake_up_bit(unsigned long *, int);
 
 void    linux_sort(void *, size_t, size_t, int (*)(const void *, const void *));
 void    linux_get_random_bytes(void *, size_t);
+
+void    linux_task_adopt(struct task_struct *);
+void    linux_task_disown(void);
+void    linux_task_destroy(struct task_struct *);
+
+/* uvm_illumos_test.c */
+void    linux_radix_tree_init(struct radix_tree_root *, gfp_t);
+void   *linux_radix_tree_lookup(struct radix_tree_root *, unsigned long);
+int     linux_radix_tree_insert(struct radix_tree_root *, unsigned long,
+            void *);
+void   *linux_radix_tree_delete(struct radix_tree_root *, unsigned long);
+void  **linux_radix_tree_iter_first(struct radix_tree_root *,
+            struct radix_tree_iter *, unsigned long);
+void  **linux_radix_tree_iter_next(struct radix_tree_root *,
+            struct radix_tree_iter *);
+int     linux_remap_pfn_range(struct vm_area_struct *, unsigned long,
+            unsigned long, unsigned long, pgprot_t);
+void   *linux_phys_to_virt(phys_addr_t);
+struct task_struct *linux_kthread_run(int (*)(void *), void *);
+int     linux_kthread_stop(struct task_struct *);
+bool    linux_kthread_should_stop(void);
 
 
 /* uvm_illumos.c */

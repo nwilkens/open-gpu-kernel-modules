@@ -30,6 +30,7 @@
  */
 
 #include "uvm_illumos.h"
+#include "uvm_illumos_mem.h"
 
 #include <sys/avl.h>
 #include <sys/vmem.h>
@@ -41,22 +42,20 @@
 #include <vm/seg_kpm.h>
 #include <vm/hat.h>
 
-#include "nvtypes.h"
-
 /* i86pc VM routines without a header that a driver can include. */
 extern caddr_t hat_kpm_pfn2va(pfn_t);
 extern page_t *page_create_io(vnode_t *, u_offset_t, uint_t, uint_t,
     struct as *, caddr_t, ddi_dma_attr_t *);
 
-/* nvidia.kmod */
-extern NvBool nv_dma_detect_remap(dev_info_t *);
-
 /* The largest CPU chunk UVM allocates is 2MB. */
 #define UVM_PAGE_MAX_ORDER      9
 #define UVM_PAGE_CONTIG_TRIES   8
 
-/* One vnode per order, so put_page() can tell how much to free. */
-static vnode_t         *uvm_page_vp[UVM_PAGE_MAX_ORDER + 1];
+/*
+ * One vnode per order, so put_page() can tell how much to free, and a
+ * second set for allocations charged to a project.
+ */
+static vnode_t         *uvm_page_vp[2][UVM_PAGE_MAX_ORDER + 1];
 static vnodeops_t      *uvm_page_vnodeops;
 static vmem_t          *uvm_page_off_arena;
 static volatile ulong_t uvm_page_count;
@@ -154,8 +153,8 @@ uvm_page_resv_wait(void)
     return (delay_sig(hz >> 2) == 0);
 }
 
-struct page *
-linux_alloc_pages(gfp_t gfp, unsigned int order)
+static page_t *
+uvm_page_alloc(vnode_t **vps, gfp_t gfp, unsigned int order)
 {
     struct seg kseg = { .s_as = &kas };
     boolean_t wait = (gfp & (__GFP_NOSLEEP | __GFP_NORETRY)) == 0;
@@ -164,9 +163,6 @@ linux_alloc_pages(gfp_t gfp, unsigned int order)
     void *off;
     page_t *plist, *head, *pp;
     uint_t tries;
-
-    if (order > UVM_PAGE_MAX_ORDER)
-        return (NULL);
 
     npages = 1UL << order;
     size = ptob(npages);
@@ -189,14 +185,14 @@ linux_alloc_pages(gfp_t gfp, unsigned int order)
      */
     for (tries = 0; ; tries++) {
         if (order == 0) {
-            plist = page_create_va(uvm_page_vp[0],
+            plist = page_create_va(vps[0],
                 (u_offset_t)(uintptr_t)off, PAGESIZE, PG_EXCL | PG_NORELOC,
                 &kseg, (caddr_t)off);
         } else {
             ddi_dma_attr_t attr = uvm_page_contig_attr;
 
             attr.dma_attr_align = size;
-            plist = page_create_io(uvm_page_vp[order],
+            plist = page_create_io(vps[order],
                 (u_offset_t)(uintptr_t)off, (uint_t)size,
                 PG_EXCL | PG_PHYSCONTIG, &kas, (caddr_t)off, &attr);
         }
@@ -233,16 +229,81 @@ linux_alloc_pages(gfp_t gfp, unsigned int order)
     return (head);
 }
 
+/*
+ * __GFP_ACCOUNT allocations are charged to the process whose mm UVM made
+ * the active memcg.  Managed CPU chunks (__GFP_HIGHMEM) are left out: their
+ * range was charged when it was mapped.  With va_space_mm disabled the mm
+ * is always the caller's own, so anything else is refused.
+ */
+struct page *
+linux_alloc_pages(gfp_t gfp, unsigned int order)
+{
+    uvm_charge_t *charge = NULL;
+    page_t *head;
+    void *memcg;
+    int err;
+
+    if (order > UVM_PAGE_MAX_ORDER)
+        return (NULL);
+
+    if ((gfp & (__GFP_ACCOUNT | __GFP_HIGHMEM)) == __GFP_ACCOUNT &&
+        (memcg = uvm_memcg_active()) != NULL) {
+        if (memcg != (void *)curproc->p_as || (gfp & __GFP_NOSLEEP) != 0)
+            return (NULL);
+        charge = uvm_charge_take(ptob(1UL << order), &err);
+        if (charge == NULL)
+            return (NULL);
+    }
+
+    head = uvm_page_alloc(uvm_page_vp[charge != NULL], gfp, order);
+    if (charge != NULL) {
+        if (head != NULL)
+            uvm_charge_page_add(charge, head);
+        else
+            uvm_charge_rele(charge);
+    }
+
+    return (head);
+}
+
+/* The order of an allocation from its vnode, or -1 if it is not ours. */
+static int
+uvm_page_order(const page_t *pp, boolean_t *charged)
+{
+    unsigned int c, order;
+
+    for (c = 0; c < 2; c++) {
+        for (order = 0; order <= UVM_PAGE_MAX_ORDER; order++) {
+            if (pp->p_vnode == uvm_page_vp[c][order]) {
+                *charged = (c != 0);
+                return ((int)order);
+            }
+        }
+    }
+    return (-1);
+}
+
 void
 linux_free_pages(struct page *head, unsigned int order)
 {
+    uvm_charge_t *charge = NULL;
+    boolean_t charged = B_FALSE;
     pgcnt_t npages, i;
     u_offset_t base;
 
     VERIFY(order <= UVM_PAGE_MAX_ORDER);
-    VERIFY(head->p_vnode == uvm_page_vp[order]);
+    VERIFY3S(uvm_page_order(head, &charged), ==, (int)order);
 
     npages = 1UL << order;
+    if (!uvm_dma_may_free(head, npages)) {
+        cmn_err(CE_WARN, "nvidia_uvm: keeping %lu pages a device may still "
+            "reach", npages);
+        return;
+    }
+
+    if (charged)
+        charge = uvm_charge_page_remove(head);
+
     base = head->p_offset;
     for (i = 1; i < npages; i++)
         base = MIN(base, head[i].p_offset);
@@ -253,27 +314,45 @@ linux_free_pages(struct page *head, unsigned int order)
     vmem_free(uvm_page_off_arena, (void *)(uintptr_t)base, ptob(npages));
     page_unresv(npages);
     atomic_add_long(&uvm_page_count, -(long)npages);
+
+    if (charge != NULL)
+        uvm_charge_rele(charge);
 }
 
 /* UVM calls put_page() only to free the pages it allocated. */
 void
 linux_put_page(struct page *pp)
 {
-    unsigned int order;
+    boolean_t charged = B_FALSE;
+    int order = uvm_page_order(pp, &charged);
 
-    for (order = 0; order <= UVM_PAGE_MAX_ORDER; order++) {
-        if (pp->p_vnode == uvm_page_vp[order]) {
-            linux_free_pages(pp, order);
-            return;
-        }
+    if (order < 0) {
+        cmn_err(CE_WARN, "nvidia_uvm: put_page of a foreign page %p",
+            (void *)pp);
+        return;
     }
-
-    cmn_err(CE_WARN, "nvidia_uvm: put_page of a foreign page %p", (void *)pp);
+    linux_free_pages(pp, (unsigned int)order);
 }
 
+/* Is this one of our pages?  Cheap enough for every kmap(). */
+boolean_t
+uvm_page_owned(const page_t *pp)
+{
+    return (pp->p_vnode != NULL && pp->p_vnode->v_op == uvm_page_vnodeops);
+}
+
+/*
+ * Pinned user pages are mapped so that revoking the pin can redirect them.
+ * They are looked for first: the frame of a revoked pin may since have
+ * become one of ours.
+ */
 void *
 linux_page_address(struct page *pp)
 {
+    void *va = uvm_pin_kmap(pp);
+
+    if (va != NULL || !uvm_page_owned(pp))
+        return (va);
     return (hat_kpm_pfn2va(pp->p_pagenum));
 }
 
@@ -289,11 +368,14 @@ linux_pfn_to_page(unsigned long pfn)
     return (page_numtopp_nolock((pfn_t)pfn));
 }
 
-/* Kernel writes through segkpm do not set the modified bit. */
+/*
+ * UVM marks only pinned user pages dirty, and those get the modified bit
+ * when they are unlocked for write.  A revoked pin may no longer own the
+ * page by now, so it is not touched here.
+ */
 void
 linux_set_page_dirty(struct page *pp)
 {
-    hat_setmod(pp);
 }
 
 /*
@@ -323,10 +405,20 @@ void *
 linux_vmap(struct page **pages, unsigned int count)
 {
     uvm_vmap_t *vm;
+    void *va;
     unsigned int i;
 
     if (count == 0)
         return (NULL);
+
+    if (uvm_pin_vmap(pages, count, &va))
+        return (va);
+
+    /* Anything else must be our own memory. */
+    for (i = 0; i < count; i++) {
+        if (!uvm_page_owned(pages[i]))
+            return (NULL);
+    }
 
     vm = kmem_zalloc(sizeof (*vm), KM_SLEEP);
     vm->uv_size = ptob((size_t)count);
@@ -350,6 +442,9 @@ linux_vunmap(const void *va)
 {
     uvm_vmap_t key, *vm;
 
+    if (uvm_pin_vunmap(va))
+        return;
+
     key.uv_va = (caddr_t)va;
     mutex_enter(&uvm_vmap_lock);
     vm = avl_find(&uvm_vmap_tree, &key, NULL);
@@ -362,97 +457,10 @@ linux_vunmap(const void *va)
     kmem_free(vm, sizeof (*vm));
 }
 
-/*
- * DMA.  Without an IOMMU a GPU reaches system memory at its physical
- * address.  Binding through an IOMMU is not implemented yet, so mappings
- * fail on a GPU behind one.
- */
-#define UVM_DMA_DEVS            32
-
-static kmutex_t uvm_dma_lock;
-static struct {
-    dev_info_t *dip;
-    boolean_t   remap;
-} uvm_dma_devs[UVM_DMA_DEVS];
-
-static boolean_t
-uvm_dma_remapped(dev_info_t *dip)
-{
-    boolean_t remap = B_TRUE;
-    uint_t i;
-
-    mutex_enter(&uvm_dma_lock);
-    for (i = 0; i < UVM_DMA_DEVS && uvm_dma_devs[i].dip != NULL; i++) {
-        if (uvm_dma_devs[i].dip == dip) {
-            remap = uvm_dma_devs[i].remap;
-            mutex_exit(&uvm_dma_lock);
-            return (remap);
-        }
-    }
-
-    if (i < UVM_DMA_DEVS) {
-        remap = nv_dma_detect_remap(dip) ? B_TRUE : B_FALSE;
-        uvm_dma_devs[i].dip = dip;
-        uvm_dma_devs[i].remap = remap;
-        if (remap) {
-            dev_err(dip, CE_WARN, "nvidia_uvm: DMA through an IOMMU is "
-                "not supported");
-        }
-    }
-    mutex_exit(&uvm_dma_lock);
-
-    return (remap);
-}
-
-dma_addr_t
-linux_dma_map_page(struct device *dev, struct page *pp, size_t off,
-    size_t size)
-{
-    if (dev == NULL || dev->dip == NULL || uvm_dma_remapped(dev->dip))
-        return (DMA_MAPPING_ERROR);
-
-    return ((dma_addr_t)ptob((uint64_t)pp->p_pagenum) + off);
-}
-
-void
-linux_dma_unmap_page(struct device *dev, dma_addr_t addr, size_t size)
-{
-}
-
-/* Coherent DMA memory is used only with Confidential Computing. */
-void *
-linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *handle,
-    gfp_t gfp)
-{
-    return (NULL);
-}
-
-void
-linux_dma_free_coherent(struct device *dev, size_t size, void *va,
-    dma_addr_t handle)
-{
-}
-
-/*
- * Pinning user memory is needed only by the tools event queues, which
- * return an error until it is implemented.
- */
-long
-linux_pin_user_pages(unsigned long start, unsigned long n, unsigned int flags,
-    struct page **pages)
-{
-    return (-ENOTSUP);
-}
-
-void
-linux_unpin_user_page(struct page *pp)
-{
-}
-
 int
 uvm_page_init(void)
 {
-    unsigned int order;
+    unsigned int c, order;
     int rc;
 
     if (!kpm_enable)
@@ -463,9 +471,11 @@ uvm_page_init(void)
     if (rc != 0)
         return (rc);
 
-    for (order = 0; order <= UVM_PAGE_MAX_ORDER; order++) {
-        uvm_page_vp[order] = vn_alloc(KM_SLEEP);
-        vn_setops(uvm_page_vp[order], uvm_page_vnodeops);
+    for (c = 0; c < 2; c++) {
+        for (order = 0; order <= UVM_PAGE_MAX_ORDER; order++) {
+            uvm_page_vp[c][order] = vn_alloc(KM_SLEEP);
+            vn_setops(uvm_page_vp[c][order], uvm_page_vnodeops);
+        }
     }
 
     /* Page offsets only; the arena maps nothing. */
@@ -476,8 +486,9 @@ uvm_page_init(void)
     mutex_init(&uvm_vmap_lock, NULL, MUTEX_DRIVER, NULL);
     avl_create(&uvm_vmap_tree, uvm_vmap_compare, sizeof (uvm_vmap_t),
         offsetof(uvm_vmap_t, uv_link));
-    mutex_init(&uvm_dma_lock, NULL, MUTEX_DRIVER, NULL);
-    bzero(uvm_dma_devs, sizeof (uvm_dma_devs));
+    uvm_dma_init();
+    uvm_acct_init();
+    uvm_pin_init();
 
     return (0);
 }
@@ -485,9 +496,12 @@ uvm_page_init(void)
 void
 uvm_page_fini(void)
 {
-    unsigned int order;
+    unsigned int c, order;
 
-    mutex_destroy(&uvm_dma_lock);
+    uvm_pin_fini();
+    uvm_acct_fini();
+    uvm_dma_fini();
+
     avl_destroy(&uvm_vmap_tree);
     mutex_destroy(&uvm_vmap_lock);
 
@@ -498,7 +512,9 @@ uvm_page_fini(void)
     }
 
     vmem_destroy(uvm_page_off_arena);
-    for (order = 0; order <= UVM_PAGE_MAX_ORDER; order++)
-        vn_free(uvm_page_vp[order]);
+    for (c = 0; c < 2; c++) {
+        for (order = 0; order <= UVM_PAGE_MAX_ORDER; order++)
+            vn_free(uvm_page_vp[c][order]);
+    }
     vn_freevnodeops(uvm_page_vnodeops);
 }

@@ -31,6 +31,8 @@
 
 #include "uvm_kpi_types.h"
 
+struct uvm_charge;
+
 /*
  * Private data of a seg_nvuvm segment.  The Linux VMA is a separate
  * allocation because splitting a segment moves it to another segment.  A
@@ -41,6 +43,7 @@ typedef struct uvm_seg_data {
     struct vm_area_struct  *usd_vma;
     struct linux_file      *usd_file;       /* held */
     struct address_space   *usd_mapping;    /* usd_file->f_mapping */
+    struct uvm_charge      *usd_charge;     /* managed ranges; shared by pieces */
     list_node_t             usd_link;       /* on usd_mapping->am_segs */
     boolean_t               usd_listed;
     uchar_t                 usd_prot;       /* PROT_* without PROT_USER */
@@ -50,6 +53,9 @@ typedef struct uvm_seg_data {
 int     uvm_seg_segmap(dev_t, off_t, struct as *, caddr_t *, off_t, uint_t,
             uint_t, uint_t, cred_t *);
 uint_t  uvm_seg_count(void);
+
+/* Releases charges left with a file when its mappings went with the process. */
+void    uvm_seg_file_release(struct linux_file *);
 
 /* Fault in [start, start + len) of one segment of mm; returns an errno. */
 int     uvm_seg_fault_range(struct mm_struct *, unsigned long, unsigned long,

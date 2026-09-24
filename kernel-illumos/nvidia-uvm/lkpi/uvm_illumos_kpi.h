@@ -40,5 +40,6 @@
 #include "kpi/uvm_kpi_sync.h"
 #include "kpi/uvm_kpi_mm.h"
 #include "kpi/uvm_kpi_file.h"
+#include "kpi/uvm_kpi_test.h"
 
 #endif /* _UVM_ILLUMOS_KPI_H_ */

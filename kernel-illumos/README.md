@@ -93,7 +93,57 @@ UVM starts on the first open of `/dev/nvidia-uvm` after an `nvidia` instance
 has attached. Until then, opens fail with `ENXIO`.
 
 These are not supported yet: GPUs behind an IOMMU, access to pageable memory
-(HMM and ATS), tools event queues, the builtin tests, and module parameters,
-which keep their default values. Without an IOMMU, a registered GPU can reach
-all of physical memory, as on Linux. Only 64-bit processes can map
+(HMM and ATS), and tools event queues. Without an IOMMU, a registered GPU can
+reach all of physical memory, as on Linux. Only 64-bit processes can map
 `/dev/nvidia-uvm`.
+
+CPU faults on UVM mappings, UVM ioctls and the last close of a UVM file can
+call into RM, which needs more than the 20 KB stack of an LWP. They run on a
+64 KB stack from `thread_splitstack()`. On a kernel without it, `nvidia_uvm`
+logs a warning at attach and runs them on the caller's stack.
+
+### UVM module parameters
+
+The Linux `nvidia-uvm` module parameters are properties of the same name in
+`/kernel/drv/nvidia_uvm.conf`. They are read once, when the first open starts
+UVM. To change them, edit the file, then unload and reload `nvidia_uvm`.
+Parameters that Linux lets you change at run time through sysfs are fixed
+once UVM has started.
+
+    uvm_perf_prefetch_threshold=75;
+    uvm_perf_fault_coalesce=0;
+    uvm_channel_gpfifo_loc="sys";
+    uvm_disable_hmm="y";
+
+- `int`, `uint` and `ulong` parameters take an integer, or a string in the
+  form Linux accepts (decimal, `0x` hex or `0` octal). Use the string form
+  for unsigned values above 2147483647.
+- `bool` parameters take 0 or 1, or one of the strings `y`, `yes`, `t`,
+  `true`, `on`, `n`, `no`, `f`, `false`, `off`.
+- `charp` parameters take a string of at most 255 bytes.
+
+A value with the wrong type, a malformed value or an out-of-range value is
+logged as a warning, and the parameter keeps its default. UVM validates most
+parameters itself and falls back to the default for values it rejects.
+`nvidia_uvm` also enforces these limits, where UVM uses a value without
+checking it:
+
+| Parameter | Accepted |
+| --- | --- |
+| `uvm_perf_pma_batch_nonpinned_order` | 0 to 10 |
+| `uvm_perf_thrashing_lapse_usec` | 0 to 500000 |
+| `uvm_perf_access_counter_migration_enable` | -1 to 1 |
+| `uvm_leak_checker` | 0 to 2 |
+
+Every parameter is listed with its type in
+`nvidia-uvm/lkpi/uvm_kpi_params.h`. A new `module_param()` in an updated
+`kernel-open/nvidia-uvm` does not compile until it is added there.
+
+### Builtin tests
+
+The UVM builtin tests are built in, as on Linux. Their ioctls fail unless
+`uvm_enable_builtin_tests=1;` is set in `nvidia_uvm.conf`. While it is set,
+every ioctl on `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, and every mmap
+of `/dev/nvidia-uvm`, also requires the `sys_config` privilege, which only the global zone has, because the test
+ioctls and the test flags of regular ioctls can expose kernel addresses and
+change driver state. Do not enable the tests on production systems.

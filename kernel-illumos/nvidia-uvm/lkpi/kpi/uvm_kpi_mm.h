@@ -90,8 +90,8 @@ static inline int get_order(unsigned long size)
 #define lock_page(pp)                       ((void)(pp))
 #define unlock_page(pp)                     ((void)(pp))
 #define virt_addr_valid(va)                 ((void)(va), false)
-#define virt_to_page(va)                    ((struct page *)NULL)
-#define vmalloc_to_page(va)                 ((struct page *)NULL)
+#define virt_to_page(va)                    ((void)(va), (struct page *)NULL)
+#define vmalloc_to_page(va)                 ((void)(va), (struct page *)NULL)
 #define is_device_private_page(pp)          ((void)(pp), false)
 #define is_device_coherent_page(pp)         ((void)(pp), false)
 #define is_pci_p2pdma_page(pp)              ((void)(pp), false)
@@ -147,6 +147,13 @@ static inline vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
 #define mmput(mm)               ((void)(mm))
 #define mmgrab(mm)              ((void)(mm))
 #define mmdrop(mm)              ((void)(mm))
+
+/* memcg: an mm stands for its owner's project and zone (uvm_illumos_acct.c). */
+struct mem_cgroup *linux_get_mem_cgroup_from_mm(struct mm_struct *);
+struct mem_cgroup *linux_set_active_memcg(struct mem_cgroup *);
+#define get_mem_cgroup_from_mm(mm)  linux_get_mem_cgroup_from_mm(mm)
+#define set_active_memcg(memcg)     linux_set_active_memcg(memcg)
+#define mem_cgroup_put(memcg)       ((void)(memcg))
 
 /* Mapping of user pages. */
 #define NV_PIN_USER_PAGES(start, n, flags, pages)                           \

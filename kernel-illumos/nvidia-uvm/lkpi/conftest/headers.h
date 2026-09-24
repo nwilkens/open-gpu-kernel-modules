@@ -35,7 +35,7 @@
 #define NV_SG_DMA_PAGE_ITER_PRESENT
 #define NV_FOR_EACH_SGTABLE_DMA_PAGE_PRESENT
 
-#define NV_IS_EXPORT_SYMBOL_PRESENT_int_active_memcg            0
+#define NV_IS_EXPORT_SYMBOL_PRESENT_int_active_memcg            1
 #define NV_IS_EXPORT_SYMBOL_PRESENT_migrate_vma_setup           0
 #define NV_IS_EXPORT_SYMBOL_PRESENT___iowrite64_lo_hi           0
 #define NV_IS_EXPORT_SYMBOL_PRESENT_make_device_exclusive       0

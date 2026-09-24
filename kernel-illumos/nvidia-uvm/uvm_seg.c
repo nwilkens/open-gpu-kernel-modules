@@ -38,6 +38,7 @@
  */
 
 #include "uvm_illumos.h"
+#include "uvm_illumos_mem.h"
 #include "uvm_seg.h"
 
 #include <sys/vmsystm.h>
@@ -191,6 +192,44 @@ uvm_vma_set_bounds(struct vm_area_struct *vma, unsigned long start,
     vma->vm_pgoff = start >> PAGE_SHIFT;
 }
 
+/*
+ * A managed range, the only kind whose memory the mapping creates.  Only
+ * uvm_vm_ops_managed in uvm.c has page_mkwrite; semaphore pools and device
+ * P2P ranges map memory allocated by ioctl, and a disabled VMA has none.
+ */
+static boolean_t
+uvm_vma_is_managed(const struct vm_area_struct *vma)
+{
+    return (vma->vm_ops != NULL && vma->vm_ops->page_mkwrite != NULL);
+}
+
+/*
+ * A managed range is charged when mapped, and the charge is shared by the
+ * pieces a partial munmap leaves, until the last one goes: UVM CPU chunks
+ * can outlive the part of the range they were allocated for.  On exit or
+ * exec UVM may keep the range as a zombie until the file is released.
+ */
+static void
+uvm_seg_charge_drop(uvm_seg_data_t *sd)
+{
+    uvm_charge_t *c = sd->usd_charge;
+
+    if (c == NULL)
+        return;
+
+    sd->usd_charge = NULL;
+    if (curproc->p_as == &kas && sd->usd_file != NULL)
+        uvm_charge_rele_deferred(c, sd->usd_file);
+    else
+        uvm_charge_rele(c);
+}
+
+void
+uvm_seg_file_release(struct linux_file *file)
+{
+    uvm_charge_release_owner(file);
+}
+
 /* vm_ops may change during a call, so it is read again every time. */
 static void
 uvm_vma_open(struct vm_area_struct *vma)
@@ -198,7 +237,7 @@ uvm_vma_open(struct vm_area_struct *vma)
     const struct vm_operations_struct *ops = vma->vm_ops;
 
     if (ops != NULL && ops->open != NULL)
-        ops->open(vma);
+        uvm_vma_op_call(ops->open, vma);
 }
 
 static void
@@ -207,7 +246,7 @@ uvm_vma_close(struct vm_area_struct *vma)
     const struct vm_operations_struct *ops = vma->vm_ops;
 
     if (ops != NULL && ops->close != NULL)
-        ops->close(vma);
+        uvm_vma_op_call(ops->close, vma);
 }
 
 /* Runs from as_map() with the AS write lock held, like Linux ->mmap. */
@@ -253,8 +292,23 @@ uvm_seg_create(struct seg **segpp, void *argsp)
     uvm_seg_list_add(sd);
 
     ret = file->f_op->mmap(file, vma);
-    if (ret == 0)
-        return (0);
+    if (ret == 0) {
+        int err;
+
+        if (!uvm_vma_is_managed(vma))
+            return (0);
+
+        /*
+         * With the AS write lock held nothing can populate the range
+         * before it is charged.  If the charge is refused, the mapping is
+         * undone as Linux undoes a failed mmap after ->mmap.
+         */
+        sd->usd_charge = uvm_charge_take(seg->s_size, &err);
+        if (sd->usd_charge != NULL)
+            return (0);
+        uvm_vma_close(vma);
+        ret = -err;
+    }
 
     uvm_seg_unload_remove(sd, seg->s_base, seg->s_size);
 
@@ -417,6 +471,10 @@ uvm_seg_unmap(struct seg *seg, caddr_t addr, size_t len)
     nsd = uvm_seg_data_alloc(nseg, sd->usd_prot, sd->usd_maxprot);
     nseg->s_ops = &uvm_seg_ops;
     nseg->s_data = nsd;
+    if (sd->usd_charge != NULL) {
+        nsd->usd_charge = sd->usd_charge;
+        uvm_charge_hold(nsd->usd_charge);
+    }
     if (sd->usd_file != NULL) {
         nsd->usd_file = sd->usd_file;
         nsd->usd_mapping = sd->usd_mapping;
@@ -461,6 +519,7 @@ uvm_seg_free(struct seg *seg)
         uvm_vma_close(sd->usd_vma);
         kmem_free(sd->usd_vma, sizeof (struct vm_area_struct));
     }
+    uvm_seg_charge_drop(sd);
 
     /* The AS write lock is held, so the last release is deferred. */
     if (sd->usd_file != NULL)
@@ -492,7 +551,7 @@ uvm_seg_vm_fault(uvm_seg_data_t *sd, caddr_t addr, size_t len,
         if (ops == NULL || ops->fault == NULL)
             return (FC_MAKE_ERR(EFAULT));
 
-        ret = ops->fault(&vmf);
+        ret = uvm_fault_call(ops->fault, &vmf);
         if (ret & VM_FAULT_OOM)
             return (FC_MAKE_ERR(ENOMEM));
         if (ret & (VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV))
@@ -843,15 +902,18 @@ uvm_seg_fault_range(struct mm_struct *mm, unsigned long start,
     return (0);
 }
 
+/* Holds are recorded per thread for linux_pin_user_pages(). */
 void
 linux_mmap_read_lock(struct mm_struct *mm)
 {
     AS_LOCK_ENTER((struct as *)mm, RW_READER);
+    uvm_mmap_note((struct as *)mm, B_FALSE, 1);
 }
 
 void
 linux_mmap_read_unlock(struct mm_struct *mm)
 {
+    uvm_mmap_note((struct as *)mm, B_FALSE, -1);
     AS_LOCK_EXIT((struct as *)mm);
 }
 
@@ -859,11 +921,13 @@ void
 linux_mmap_write_lock(struct mm_struct *mm)
 {
     AS_LOCK_ENTER((struct as *)mm, RW_WRITER);
+    uvm_mmap_note((struct as *)mm, B_TRUE, 1);
 }
 
 void
 linux_mmap_write_unlock(struct mm_struct *mm)
 {
+    uvm_mmap_note((struct as *)mm, B_TRUE, -1);
     AS_LOCK_EXIT((struct as *)mm);
 }
 
