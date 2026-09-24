@@ -466,6 +466,7 @@ extern NvU32 nv_dma_remap_peer_mmio;
 int  nv_caps_init(void);
 void nv_caps_fini(void);
 void nv_caps_attach(dev_info_t *);
+void nv_caps_detach(void);
 int  nv_caps_open(nv_illumos_file_private_t *, NvU32 node, cred_t *);
 void nv_caps_close(nv_illumos_file_private_t *);
 int  nv_caps_imex_init(void);

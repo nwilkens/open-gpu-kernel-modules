@@ -269,6 +269,7 @@ nv_detach_ctl(dev_info_t *dip)
     if (nvlink_ctl_detach(dip) != DDI_SUCCESS)
         return (DDI_FAILURE);
 
+    nv_caps_detach();
     ddi_remove_minor_node(dip, NULL);
     (void) ddi_prop_remove_all(dip);
     nv_ctl_dip = NULL;

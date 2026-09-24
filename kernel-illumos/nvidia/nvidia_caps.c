@@ -170,6 +170,14 @@ nv_cap_t *nvidia_caps_root;
 static nv_cap_t *nv_cap_by_minor[NV_MINOR_CAPS_COUNT];
 static kmutex_t nv_caps_lock;
 
+/*
+ * The control node once attached.  RM registers system capabilities while
+ * it initializes, which can precede that attach, so nodes for capabilities
+ * registered earlier are created by nv_caps_attach().  Guarded by
+ * nv_caps_lock.
+ */
+static dev_info_t *nv_caps_dip;
+
 static int
 nv_cap_find_minor(const char *path)
 {
@@ -275,11 +283,20 @@ nv_cap_free(nv_cap_t *cap)
     kmem_free(cap, sizeof (*cap));
 }
 
+static int
+nv_cap_create_node(dev_info_t *dip, int minor)
+{
+    char node[32];
+
+    (void) snprintf(node, sizeof (node), "nvidia-cap%d", minor);
+    return ddi_create_minor_node(dip, node, S_IFCHR,
+        NV_MINOR_CAPS_BASE + minor, NV_DDI_NT_CAPS, 0);
+}
+
 nv_cap_t* NV_API_CALL os_nv_cap_create_file_entry(nv_cap_t *parent_cap,
     const char *name, int mode)
 {
     nv_cap_t *cap;
-    char node[32];
     int minor;
 
     cap = nv_cap_alloc(parent_cap, name);
@@ -289,7 +306,7 @@ nv_cap_t* NV_API_CALL os_nv_cap_create_file_entry(nv_cap_t *parent_cap,
     cap->permissions = mode;
 
     minor = nv_cap_find_minor(cap->path);
-    if (minor < 0 || minor >= (int)NV_MINOR_CAPS_COUNT || nv_ctl_dip == NULL)
+    if (minor < 0 || minor >= (int)NV_MINOR_CAPS_COUNT)
     {
         nv_cap_free(cap);
         return NULL;
@@ -297,7 +314,9 @@ nv_cap_t* NV_API_CALL os_nv_cap_create_file_entry(nv_cap_t *parent_cap,
     cap->minor = minor;
 
     mutex_enter(&nv_caps_lock);
-    if (nv_cap_by_minor[minor] != NULL)
+    if (nv_cap_by_minor[minor] != NULL ||
+        (nv_caps_dip != NULL &&
+         nv_cap_create_node(nv_caps_dip, minor) != DDI_SUCCESS))
     {
         mutex_exit(&nv_caps_lock);
         nv_cap_free(cap);
@@ -305,17 +324,6 @@ nv_cap_t* NV_API_CALL os_nv_cap_create_file_entry(nv_cap_t *parent_cap,
     }
     nv_cap_by_minor[minor] = cap;
     mutex_exit(&nv_caps_lock);
-
-    (void) snprintf(node, sizeof (node), "nvidia-cap%d", minor);
-    if (ddi_create_minor_node(nv_ctl_dip, node, S_IFCHR,
-            NV_MINOR_CAPS_BASE + minor, NV_DDI_NT_CAPS, 0) != DDI_SUCCESS)
-    {
-        mutex_enter(&nv_caps_lock);
-        nv_cap_by_minor[minor] = NULL;
-        mutex_exit(&nv_caps_lock);
-        nv_cap_free(cap);
-        return NULL;
-    }
 
     return cap;
 }
@@ -365,14 +373,16 @@ void NV_API_CALL os_nv_cap_destroy_entry(nv_cap_t *cap)
     {
         mutex_enter(&nv_caps_lock);
         if (nv_cap_by_minor[cap->minor] == cap)
-            nv_cap_by_minor[cap->minor] = NULL;
-        mutex_exit(&nv_caps_lock);
-
-        if (nv_ctl_dip != NULL)
         {
-            (void) snprintf(node, sizeof (node), "nvidia-cap%d", cap->minor);
-            ddi_remove_minor_node(nv_ctl_dip, node);
+            nv_cap_by_minor[cap->minor] = NULL;
+            if (nv_caps_dip != NULL)
+            {
+                (void) snprintf(node, sizeof (node), "nvidia-cap%d",
+                    cap->minor);
+                ddi_remove_minor_node(nv_caps_dip, node);
+            }
         }
+        mutex_exit(&nv_caps_lock);
     }
 
     nv_cap_free(cap);
@@ -564,6 +574,20 @@ nv_caps_fini(void)
 void
 nv_caps_attach(dev_info_t *dip)
 {
+    int minor;
+
+    mutex_enter(&nv_caps_lock);
+    nv_caps_dip = dip;
+    for (minor = 0; minor < (int)NV_MINOR_CAPS_COUNT; minor++)
+    {
+        if (nv_cap_by_minor[minor] != NULL &&
+            nv_cap_create_node(dip, minor) != DDI_SUCCESS)
+        {
+            dev_err(dip, CE_WARN, "cannot create nvidia-cap%d", minor);
+        }
+    }
+    mutex_exit(&nv_caps_lock);
+
     nv_cap_publish_minors(dip);
 
     if (NVreg_ImexChannelCount != 0 && NVreg_CreateImexChannel0 == 1)
@@ -575,6 +599,15 @@ nv_caps_attach(dev_info_t *dip)
                 "Make sure you are aware of the IMEX security model.\n");
         }
     }
+}
+
+/* The caller removes the control node's minor nodes. */
+void
+nv_caps_detach(void)
+{
+    mutex_enter(&nv_caps_lock);
+    nv_caps_dip = NULL;
+    mutex_exit(&nv_caps_lock);
 }
 
 /*
