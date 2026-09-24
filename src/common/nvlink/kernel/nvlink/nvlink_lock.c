@@ -38,10 +38,10 @@
 static void   _sort_links(nvlink_link **, NvU32, NvBool (*)(void *, void *));
 static NvBool _compare(void *, void *);
 
-#if defined(NV_LINUX)
+#if defined(NV_LINUX) || defined(NV_SUNOS)
 #undef TOP_LEVEL_LOCKING_DISABLED 
 #   define TOP_LEVEL_LOCKING_DISABLED 0
-#endif  /* defined(NV_LINUX) */
+#endif  /* defined(NV_LINUX) || defined(NV_SUNOS) */
 /*
  * Allocate top level lock. Return NVL_SUCCESS if 
  * the lock was allocated else return NVL_ERR_GENERIC.
