@@ -54,6 +54,15 @@ $(nv_modeset_kernel_o_binary): $(nv_modeset_kernel_o)
 # the kernel modules with kbuild.
 ###########################################################################
 
+ifeq ($(TARGET_OS),SunOS)
+.PHONY: modules
+modules: $(nv_kernel_o) $(nv_modeset_kernel_o)
+	$(MAKE) -C kernel-illumos
+
+.PHONY: modules_install
+modules_install:
+	$(MAKE) -C kernel-illumos install
+else
 .PHONY: modules
 modules: $(nv_kernel_o_binary) $(nv_modeset_kernel_o_binary)
 	$(MAKE) -C kernel-open modules
@@ -65,6 +74,7 @@ modules: $(nv_kernel_o_binary) $(nv_modeset_kernel_o_binary)
 .PHONY: modules_install
 modules_install:
 	$(MAKE) -C kernel-open modules_install
+endif
 
 ###########################################################################
 # clean
@@ -83,4 +93,8 @@ nvidia-modeset.clean:
 
 .PHONY: kernel-open.clean
 kernel-open.clean:
+ifeq ($(TARGET_OS),SunOS)
+	$(MAKE) -C kernel-illumos clean
+else
 	$(MAKE) -C kernel-open clean
+endif

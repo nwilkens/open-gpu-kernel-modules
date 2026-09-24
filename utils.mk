@@ -133,6 +133,13 @@ endif
 
 ifeq ($(TARGET_OS),SunOS)
   CFLAGS += -DNV_SUNOS
+  # illumos ships the GNU binutils with a g prefix.
+  ifneq ($(filter default file,$(origin LD)),)
+    LD                := gld
+  endif
+  ifneq ($(filter default file,$(origin OBJCOPY)),)
+    OBJCOPY           := gobjcopy
+  endif
 endif
 
 ifndef TARGET_ARCH
