@@ -121,6 +121,23 @@
 #include <kernel/gpu/nvlink/common_nvlink.h>
 #include <kernel/rmapi/mapping_list.h>
 #include <mem_mgr/fabric_vaspace.h>
+#include <kernel/mem_mgr/os_desc_mem.h>
+#if defined(NV_SUNOS)
+#include <kernel/gpu/mem_mgr/mem_desc.h>
+#include <mem_mgr/io_vaspace.h>
+#include <kernel/rmapi/nv_gpu_ops_original_gate.h>
+/* Implemented by the illumos long-term pin owner. */
+NV_STATUS os_umem_import_reserve(void *, void *, NvU32, void **);
+void os_umem_import_cancel(void *);
+void os_umem_import_guard_acquired(void *);
+void os_umem_import_copy_window(void *, NvBool);
+NV_STATUS os_umem_import_guard_released(void *);
+NvBool os_umem_import_guard_pending(void *);
+NvU32 os_umem_import_guard_count(void *);
+NvBool os_umem_import_all_hardware_complete(void *);
+void *os_umem_import_memdesc(void *);
+void os_umem_import_put(void *);
+#endif
 #include <mem_mgr/gpu_vaspace.h>
 #include <mem_mgr/vaspace.h>
 #include <mmu/gmmu_fmt.h>
@@ -2808,6 +2825,199 @@ cleanup_vaspace:
     portMemFree(gpuVaSpace);
     return status;
 }
+
+#if defined(NV_SUNOS)
+NV_STATUS nvGpuOpsRevokeAddressSpace(struct gpuAddressSpace *vaSpace)
+{
+    nvGpuOpsLockSet acquiredLocks;
+    THREAD_STATE_NODE threadState;
+    RsClient *pClient = NULL;
+    OBJVASPACE *pVAS = NULL;
+    OBJGVASPACE *pGVAS;
+    NV_STATUS status;
+
+    if (vaSpace == NULL || vaSpace->device == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = _nvGpuOpsLocksAcquireAll(RMAPI_LOCK_FLAGS_READ,
+                                      vaSpace->device->session->handle,
+                                      &pClient, &acquiredLocks);
+    if (status != NV_OK)
+        goto done_thread;
+
+    status = vaspaceGetByHandleOrDeviceDefault(pClient,
+                                               vaSpace->device->handle,
+                                               vaSpace->handle,
+                                               &pVAS);
+    if (status != NV_OK)
+        goto done_lock;
+
+    pGVAS = dynamicCast(pVAS, OBJGVASPACE);
+    if (pGVAS == NULL || !gvaspaceIsExternallyOwned(pGVAS)) {
+        status = NV_ERR_INVALID_OBJECT;
+        goto done_lock;
+    }
+
+    /* Sticky across retries. New raw RM channels using this VAS cannot run. */
+    portAtomicOrU32(&pGVAS->uvmRevoked, 1);
+
+done_lock:
+    _nvGpuOpsLocksRelease(&acquiredLocks);
+done_thread:
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+#include "nv_gpu_ops_channel_gate_impl.h"
+
+/*
+ * A UVM VA space can be shared with raw user-client channels that are not in
+ * UVM's registered_channels list.  Verify all RM clients after UVM has
+ * stopped its registered channels.  The RM API write lock excludes normal
+ * client creation; serverLockAllClients is taken before any GPU lock and
+ * without holding the UVM session client lock.
+ */
+NV_STATUS nvGpuOpsVerifyVaSpaceChannelsRevoked(struct gpuAddressSpace *vaSpace)
+{
+    OBJSYS *pSys = SYS_GET_INSTANCE();
+    THREAD_STATE_NODE threadState;
+    RsClient *pSessionClient = NULL;
+    OBJVASPACE *pVAS = NULL;
+    OBJGVASPACE *pGVAS;
+    RsLockedClientListIter clientIt;
+    RS_ORDERED_ITERATOR channelIt;
+    CLIENT_ENTRY *pEntry;
+    RsClient *pClient;
+    KernelChannel *pChannel;
+    NvU64 threadId;
+    NvU32 bucket;
+    NV_STATUS status;
+    NvBool semaHeld = NV_FALSE;
+    NvBool apiHeld = NV_FALSE;
+    NvBool clientsHeld = NV_FALSE;
+
+    if (vaSpace == NULL || vaSpace->device == NULL || pSys == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = osAcquireRmSema(pSys->pSema);
+    if (status != NV_OK)
+        goto done;
+    semaHeld = NV_TRUE;
+
+    status = rmapiLockAcquire(RMAPI_LOCK_FLAGS_NONE, RM_LOCK_MODULES_GPU_OPS);
+    if (status != NV_OK)
+        goto done;
+    apiHeld = NV_TRUE;
+
+    status = serverLockAllClients(&g_resServ);
+    if (status != NV_OK)
+        goto done;
+    clientsHeld = NV_TRUE;
+
+    /*
+     * All-client locking snapshots active clients but deliberately skips
+     * pending-free clients.  A client inserted by an exceptional path after
+     * the snapshot is also not locked.  Neither case proves quiescence.
+     */
+    threadId = portThreadGetCurrentThreadId();
+    serverAcquireClientListLock(&g_resServ);
+    for (bucket = 0; bucket < RS_CLIENT_HANDLE_BUCKET_COUNT; bucket++)
+    {
+        RsClientList *pList = &g_resServ.pClientSortedList[bucket];
+
+        for (pEntry = listHead(pList); pEntry != NULL;
+             pEntry = listNext(pList, pEntry))
+        {
+            if (pEntry->pClient == NULL)
+                continue;
+            if (pEntry->bPendingFree || pEntry->lockOwnerTid != threadId)
+            {
+                status = NV_ERR_BUSY_RETRY;
+                break;
+            }
+        }
+        if (status != NV_OK)
+            break;
+    }
+    serverReleaseClientListLock(&g_resServ);
+    if (status != NV_OK)
+        goto done;
+
+    status = serverGetClientUnderLock(&g_resServ,
+                                     vaSpace->device->session->handle,
+                                     &pSessionClient);
+    if (status != NV_OK)
+        goto done;
+    status = vaspaceGetByHandleOrDeviceDefault(pSessionClient,
+                                               vaSpace->device->handle,
+                                               vaSpace->handle, &pVAS);
+    if (status != NV_OK)
+        goto done;
+    pGVAS = dynamicCast(pVAS, OBJGVASPACE);
+    if (pGVAS == NULL || !gvaspaceIsExternallyOwned(pGVAS) ||
+        portAtomicOrU32(&pGVAS->uvmRevoked, 0) == 0)
+    {
+        status = NV_ERR_INVALID_STATE;
+        goto done;
+    }
+
+    clientIt = listIterAll(&g_resServ.lockedClientList);
+    while (listIterNext(&clientIt))
+    {
+        pEntry = *clientIt.pValue;
+        if (pEntry == NULL)
+            continue;
+        pClient = pEntry->pClient;
+        if (pClient == NULL)
+        {
+            status = NV_ERR_BUSY_RETRY;
+            break;
+        }
+        channelIt = kchannelGetIter(pClient, NULL);
+        while (clientRefOrderedIterNext(pClient, &channelIt))
+        {
+            pChannel = dynamicCast(channelIt.pResourceRef->pResource,
+                                   KernelChannel);
+            if (pChannel == NULL)
+            {
+                status = NV_ERR_INVALID_STATE;
+                break;
+            }
+            status = nvGpuOpsChannelRevocationStatus(pVAS, pChannel);
+            if (status != NV_OK)
+            {
+                break;
+            }
+        }
+        if (status != NV_OK)
+            break;
+    }
+
+done:
+    if (clientsHeld)
+        (void) serverUnlockAllClients(&g_resServ);
+    if (apiHeld)
+        rmapiLockRelease();
+    if (semaHeld)
+        osReleaseRmSema(pSys->pSema, NULL);
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+#else
+NV_STATUS nvGpuOpsRevokeAddressSpace(struct gpuAddressSpace *vaSpace)
+{
+    (void)vaSpace;
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+NV_STATUS nvGpuOpsVerifyVaSpaceChannelsRevoked(struct gpuAddressSpace *vaSpace)
+{
+    (void)vaSpace;
+    return NV_ERR_NOT_SUPPORTED;
+}
+#endif
 
 // Get the NVLink connection status for the given device. On success, caller is
 // responsible of freeing the memory.
@@ -8338,7 +8548,8 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
                            NvHandle hPhysMemory,
                            NvU32 flags,
                            NvHandle *hDupMemory,
-                           gpuMemoryInfo *pGpuMemoryInfo)
+                           gpuMemoryInfo *pGpuMemoryInfo,
+                           void **ppImportToken)
 {
     NV_STATUS status = NV_OK;
     nvGpuOpsLockSet acquiredLocks;
@@ -8357,6 +8568,15 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
     struct gpuSession *session;
     NvHandle hParent;
     NvBool bIsIndirectPeer = NV_FALSE;
+#if defined(NV_SUNOS)
+    void *importToken = NULL;
+    PMEMORY_DESCRIPTOR pImportGuardMemDesc = NULL;
+    NvBool bImportTokenCanCancel = NV_TRUE;
+    NvBool bImportIovaMapped = NV_FALSE;
+#endif
+
+    if (ppImportToken != NULL)
+        *ppImportToken = NULL;
 
     if (!device || !hDupMemory)
         return NV_ERR_INVALID_ARGUMENT;
@@ -8394,6 +8614,33 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
     pMemDesc = pMemory->pMemDesc;
     NV_ASSERT(!memdescHasSubDeviceMemDescs(pMemDesc));
 
+#if defined(NV_SUNOS)
+    /*
+     * The OS page-array memdesc retains the exact os_lock_user_pages()
+     * page_array in its private data. Match that pointer in the pin registry
+     * while the source and destination RM clients are locked, before an IOMMU
+     * mapping or duplicate handle can become visible to UVM. The RM memory
+     * object need not have OsDescMemory as its dynamic class: NVENC's OS
+     * descriptor copies are exposed through a generic Memory wrapper.
+     * Other memdesc private pointers are absent from the registry and return
+     * a NULL token.
+     */
+    if (ppImportToken != NULL)
+    {
+        status = os_umem_import_reserve(memdescGetMemData(pMemDesc),
+                                        pMemDesc, device->session->handle,
+                                        &importToken);
+        if (status != NV_OK)
+            goto done;
+        if (importToken != NULL)
+        {
+            memdescAddRef(pMemDesc);
+            pImportGuardMemDesc = pMemDesc;
+            os_umem_import_guard_acquired(importToken);
+        }
+    }
+#endif
+
     pAdjustedMemDesc = pMemDesc;
     pFabricVAS       = dynamicCast(pMappingGpu->pFabricVAS, FABRIC_VASPACE);
     if (pFabricVAS != NULL)
@@ -8402,6 +8649,15 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
         if (status != NV_OK)
             goto done;
     }
+
+#if defined(NV_SUNOS)
+    /* The tracked guard covers only the original OS page-array memdesc. */
+    if (importToken != NULL && pAdjustedMemDesc != pMemDesc)
+    {
+        status = NV_ERR_NOT_SUPPORTED;
+        goto freeGpaMemdesc;
+    }
+#endif
 
     if (memdescGetAddressSpace(pAdjustedMemDesc) != ADDR_FBMEM &&
         memdescGetAddressSpace(pAdjustedMemDesc) != ADDR_SYSMEM &&
@@ -8437,6 +8693,10 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
         status = memdescMapIommu(pAdjustedMemDesc, pMappingGpu->busInfo.iovaspaceId);
         if (status != NV_OK)
             goto freeGpaMemdesc;
+#if defined(NV_SUNOS)
+        if (importToken != NULL)
+            bImportIovaMapped = NV_TRUE;
+#endif
     }
 
     session = device->session;
@@ -8480,6 +8740,9 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
     }
 
     dupedMemHandle = NV01_NULL_OBJECT;
+#if defined(NV_SUNOS)
+    os_umem_import_copy_window(importToken, NV_TRUE);
+#endif
     status = pRmApi->DupObject(pRmApi,
                                session->handle,
                                hParent,
@@ -8487,6 +8750,9 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
                                hClient,
                                hPhysMemory,
                                flags);
+#if defined(NV_SUNOS)
+    os_umem_import_copy_window(importToken, NV_FALSE);
+#endif
     if (status != NV_OK)
         goto freeGpaMemdesc;
 
@@ -8505,13 +8771,67 @@ static NV_STATUS dupMemory(struct gpuDevice *device,
 
 freeDupedMem:
     if (status != NV_OK)
-        pRmApi->Free(pRmApi, session->handle, dupedMemHandle);
+    {
+        NV_STATUS freeStatus = pRmApi->Free(pRmApi, session->handle,
+                                           dupedMemHandle);
+#if defined(NV_SUNOS)
+        /* An unfreed alias must continue owning the pin. */
+        if (freeStatus != NV_OK && importToken != NULL)
+            bImportTokenCanCancel = NV_FALSE;
+#else
+        (void)freeStatus;
+#endif
+    }
 
 freeGpaMemdesc:
+#if defined(NV_SUNOS)
+    if (status != NV_OK && importToken != NULL && bImportIovaMapped &&
+        bImportTokenCanCancel)
+    {
+        NV_STATUS unmapStatus = memdescUnmapIommuDupChecked(
+            pAdjustedMemDesc, pMappingGpu->busInfo.iovaspaceId);
+        if (unmapStatus != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "tracked duplicate IOVA rollback failed: 0x%x\n",
+                      unmapStatus);
+            bImportTokenCanCancel = NV_FALSE;
+        }
+    }
+#endif
     if (pAdjustedMemDesc != pMemDesc)
         fabricvaspacePutGpaMemdesc(pFabricVAS, pAdjustedMemDesc);
 
 done:
+#if defined(NV_SUNOS)
+    if (importToken != NULL)
+    {
+        if (status == NV_OK && ppImportToken != NULL)
+            *ppImportToken = importToken;
+        else if (bImportTokenCanCancel)
+        {
+            if (pImportGuardMemDesc != NULL)
+            {
+                NV_STATUS guardStatus = os_umem_import_guard_released(
+                    pImportGuardMemDesc);
+                if (guardStatus != NV_OK)
+                {
+                    NV_PRINTF(LEVEL_ERROR, "tracked UVM guard bookkeeping failed; retaining pin token\n");
+                    goto releaseLocks;
+                }
+                os_umem_import_cancel(importToken);
+                memdescDestroy(pImportGuardMemDesc);
+            }
+            else
+                os_umem_import_cancel(importToken);
+        }
+        else
+            NV_PRINTF(LEVEL_ERROR, "tracked UVM duplicate cleanup failed; retaining pin token\n");
+    }
+#endif
+#if defined(NV_SUNOS)
+releaseLocks:
+#endif
     _nvGpuOpsLocksRelease(&acquiredLocks);
     threadStateFree(pThreadState, THREAD_STATE_FLAGS_NONE);
     return status;
@@ -8528,7 +8848,27 @@ NV_STATUS nvGpuOpsDupMemory(struct gpuDevice *device,
                      hPhysMemory,
                      NV04_DUP_HANDLE_FLAGS_REJECT_KERNEL_DUP_PRIVILEGE,
                      hDupMemory,
-                     pGpuMemoryInfo);
+                     pGpuMemoryInfo,
+                     NULL);
+}
+
+NV_STATUS nvGpuOpsDupMemoryTracked(struct gpuDevice *device,
+                                  NvHandle hClient,
+                                  NvHandle hPhysMemory,
+                                  NvHandle *hDupMemory,
+                                  gpuMemoryInfo *pGpuMemoryInfo,
+                                  void **ppImportToken)
+{
+    if (ppImportToken == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    return dupMemory(device,
+                     hClient,
+                     hPhysMemory,
+                     NV04_DUP_HANDLE_FLAGS_REJECT_KERNEL_DUP_PRIVILEGE,
+                     hDupMemory,
+                     pGpuMemoryInfo,
+                     ppImportToken);
 }
 
 NV_STATUS nvGpuOpsDupAllocation(struct gpuAddressSpace *srcVaSpace,
@@ -8568,7 +8908,8 @@ NV_STATUS nvGpuOpsDupAllocation(struct gpuAddressSpace *srcVaSpace,
                        srcPhysHandle,
                        NV04_DUP_HANDLE_FLAGS_NONE,
                        &dstPhysHandle,
-                       &gpuMemoryInfo);
+                       &gpuMemoryInfo,
+                       NULL);
 
     if (status != NV_OK)
         return status;
@@ -9360,8 +9701,13 @@ NV_STATUS nvGpuOpsGetNvlinkInfo(struct gpuDevice *device, gpuNvlinkInfo *nvlinkI
 // call pRmApi->Free(pRmApi, ) that drops the GPU locks if acquired (and
 // re-acquires it later).
 //
-NV_STATUS nvGpuOpsFreeDupedHandle(struct gpuDevice *device,
-                                  NvHandle hPhysHandle)
+#include "nv_gpu_ops_iommu_impl.h"
+#include "nv_gpu_ops_free_status_impl.h"
+
+static NV_STATUS freeDupedHandle(struct gpuDevice *device,
+                                 NvHandle hPhysHandle,
+                                 NvBool bChecked,
+                                 NvBool *pIovaReleased)
 {
     NV_STATUS status = NV_OK;
     nvGpuOpsLockSet acquiredLocks;
@@ -9372,6 +9718,8 @@ NV_STATUS nvGpuOpsFreeDupedHandle(struct gpuDevice *device,
     RsClient *pClient;
     Subdevice *pSubdevice;
     NvHandle hClient;
+    NvBool bKeepHandle = bChecked;
+    NV_STATUS freeStatus;
 
     if (!device)
         return NV_ERR_INVALID_ARGUMENT;
@@ -9400,22 +9748,201 @@ NV_STATUS nvGpuOpsFreeDupedHandle(struct gpuDevice *device,
     if (status != NV_OK)
         goto out;
 
-    if (memdescRequiresIommuMapping(pMemory->pMemDesc))
+    if (!bChecked || !*pIovaReleased)
     {
-        // Release the mappings acquired in nvGpuOpsDupMemory().
-        //
-        // TODO: Bug 1811060: Add native support for this use-case in RM API.
-        memdescUnmapIommu(pMemory->pMemDesc, pMappingGpu->busInfo.iovaspaceId);
+        status = nvGpuOpsUnmapDupIommu(pMemory,
+                                      pMappingGpu->busInfo.iovaspaceId,
+                                      bChecked);
+        if (status != NV_OK)
+        {
+            bKeepHandle = NV_TRUE;
+            goto out;
+        }
+        if (bChecked)
+            *pIovaReleased = NV_TRUE;
     }
 
     _disablePeerAccess(device, memdescGetAddressSpace(pMemory->pMemDesc));
+    bKeepHandle = NV_FALSE;
 
 out:
-    pRmApi->Free(pRmApi, device->session->handle, hPhysHandle);
+    if (!bKeepHandle)
+    {
+        freeStatus = pRmApi->Free(pRmApi, device->session->handle, hPhysHandle);
+        status = nvGpuOpsDupFreeResult(status, freeStatus);
+    }
     _nvGpuOpsLocksRelease(&acquiredLocks);
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return status;
 }
+
+NV_STATUS nvGpuOpsFreeDupedHandle(struct gpuDevice *device,
+                                  NvHandle hPhysHandle)
+{
+    return freeDupedHandle(device, hPhysHandle, NV_FALSE, NULL);
+}
+
+NV_STATUS nvGpuOpsFreeDupedHandleChecked(struct gpuDevice *device,
+                                         NvHandle hPhysHandle,
+                                         NvBool *pIovaReleased)
+{
+    if (pIovaReleased == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    return freeDupedHandle(device, hPhysHandle, NV_TRUE, pIovaReleased);
+}
+
+NV_STATUS nvGpuOpsReleaseImportGuard(struct gpuDevice *device,
+                                     void *importToken)
+{
+#if defined(NV_SUNOS)
+    nvGpuOpsLockSet acquiredLocks;
+    THREAD_STATE_NODE threadState;
+    RsClient *pClient;
+    PMEMORY_DESCRIPTOR pMemDesc;
+    nv_original_guard_result_t guardAction;
+    NV_STATUS status;
+
+    if (device == NULL || importToken == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = _nvGpuOpsLocksAcquire(RMAPI_LOCK_FLAGS_READ,
+                                   device->session->handle, &pClient,
+                                   0, 0, 0, &acquiredLocks);
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    /* The final original Memory may have completed this token already. */
+    if (!os_umem_import_guard_pending(importToken))
+    {
+        status = NV_OK;
+        goto done;
+    }
+
+    pMemDesc = os_umem_import_memdesc(importToken);
+    if (pMemDesc == NULL || os_umem_import_guard_count(pMemDesc) == 0)
+    {
+        status = NV_ERR_INVALID_STATE;
+        goto done;
+    }
+
+    guardAction = nv_original_guard_action(
+        os_umem_import_guard_count(pMemDesc), pMemDesc->DupCount,
+        os_umem_import_all_hardware_complete(pMemDesc));
+    if (guardAction == NV_ORIGINAL_GUARD_TRANSFER)
+    {
+        /* Registry ownership survives until original RM Memory teardown. */
+        status = NV_WARN_MORE_PROCESSING_REQUIRED;
+        goto done;
+    }
+
+    status = memReleaseTrackedOsDescGuardsChecked(pMemDesc, 0);
+
+done:
+    _nvGpuOpsLocksRelease(&acquiredLocks);
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    if (status == NV_OK || status == NV_WARN_MORE_PROCESSING_REQUIRED)
+        os_umem_import_put(importToken);
+    return status;
+#else
+    (void)device;
+    (void)importToken;
+    return NV_OK;
+#endif
+}
+
+#if defined(NV_SUNOS)
+/*
+ * The AS callback may retire only the original, unmapped OS descriptor.
+ * Ordinary RM Free discards several auto-unmap errors, so reject any
+ * resource shape that would exercise those paths before calling it.
+ */
+NV_STATUS
+nvGpuOpsFreeOriginalOsDescChecked(NvU32 hClient, NvU32 hMemory,
+                                  void *expectedMemDesc)
+{
+    nvGpuOpsLockSet acquiredLocks;
+    THREAD_STATE_NODE threadState;
+    Memory *pMemory = NULL;
+    RsResourceRef *pRef;
+    RsCpuMapping *pCpuMapping;
+    MEMORY_DESCRIPTOR *pMemDesc;
+    nv_original_gate_input_t gate = {0};
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    NV_STATUS status;
+
+    if (expectedMemDesc == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = _nvGpuOpsLocksAcquireAll(RMAPI_LOCK_FLAGS_READ, hClient,
+                                     NULL, &acquiredLocks);
+    if (status != NV_OK)
+        goto done_thread;
+
+    status = nvGpuOpsGetMemoryByHandle(hClient, hMemory, &pMemory);
+    if (status != NV_OK)
+        goto done_lock;
+    pMemDesc = pMemory->pMemDesc;
+    if (pMemDesc != expectedMemDesc ||
+        dynamicCast(pMemory, OsDescMemory) == NULL) {
+        status = NV_ERR_INVALID_OBJECT;
+        goto done_lock;
+    }
+
+    pRef = RES_GET_REF(pMemory);
+    pCpuMapping = listHead(&pRef->cpuMappings);
+    gate.dup_count = pMemDesc->DupCount;
+    gate.ref_count = pMemDesc->RefCount;
+    gate.guards = os_umem_import_guard_count(pMemDesc);
+    gate.all_imports_complete =
+        os_umem_import_all_hardware_complete(pMemDesc);
+    gate.cpu_mapping_count = listCount(&pRef->cpuMappings);
+    gate.cpu_mapping_is_os_descriptor = pCpuMapping != NULL &&
+        FLD_TEST_DRF(OS33, _FLAGS, _OS_DESCRIPTOR, _ENABLE,
+                     pCpuMapping->flags) &&
+        pCpuMapping->pLinearAddress == NvP64_NULL;
+    gate.backref_count = listCount(&pRef->backRefs);
+    gate.inter_mapping_count = mapCount(&pRef->interMappingContextMap);
+    gate.inter_backref_count =
+        listCount(&pRef->interBackRefsMappable) +
+        listCount(&pRef->interBackRefsContext);
+    gate.child_count = multimapCountItems(&pRef->childRefMap);
+    gate.dependent_count = multimapCountItems(&pRef->depRefMap) +
+        multimapCountItems(&pRef->depBackRefMap);
+
+    if (!nv_original_gate_allows_free(&gate)) {
+        NV_PRINTF(LEVEL_ERROR,
+            "original OS descriptor cannot retire: dup=%u ref=%u guards=%u "
+            "cpu=%u back=%u inter=%u interback=%u child=%u dep=%u\n",
+            gate.dup_count, gate.ref_count, gate.guards,
+            gate.cpu_mapping_count, gate.backref_count,
+            gate.inter_mapping_count, gate.inter_backref_count,
+            gate.child_count, gate.dependent_count);
+        status = NV_ERR_INVALID_STATE;
+        goto done_lock;
+    }
+
+    while (pMemDesc->_pIommuMappings != NULL) {
+        NvU32 iovaspaceId = pMemDesc->_pIommuMappings->iovaspaceId;
+
+        status = memdescUnmapIommuChecked(pMemDesc, iovaspaceId);
+        if (status != NV_OK)
+            goto done_lock;
+    }
+
+    status = pRmApi->Free(pRmApi, hClient, hMemory);
+
+done_lock:
+    _nvGpuOpsLocksRelease(&acquiredLocks);
+done_thread:
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+#endif
 
 NV_STATUS nvGpuOpsInitFaultInfo(struct gpuDevice *device,
                                 gpuFaultInfo *pFaultInfo)
@@ -11134,6 +11661,24 @@ NV_STATUS nvGpuOpsBindChannelResources(gpuRetainedChannel *retainedChannel,
         return status;
     }
 
+#if defined(NV_SUNOS)
+    if (portAtomicOrU32(&pKernelChannel->uvmRevoked, 0) != 0)
+    {
+        _nvGpuOpsLocksRelease(&acquiredLocks);
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return NV_ERR_INVALID_STATE;
+    }
+    {
+        OBJGVASPACE *pGVAS = dynamicCast(pKernelChannel->pVAS, OBJGVASPACE);
+        if (pGVAS != NULL && portAtomicOrU32(&pGVAS->uvmRevoked, 0) != 0)
+        {
+            _nvGpuOpsLocksRelease(&acquiredLocks);
+            threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+            return NV_ERR_INVALID_STATE;
+        }
+    }
+#endif
+
     // Unregister channel resources. CE channels have 0 resources, so they skip this step
     if (retainedChannel->resourceCount != 0)
     {
@@ -11196,8 +11741,10 @@ NV_STATUS nvGpuOpsBindChannelResources(gpuRetainedChannel *retainedChannel,
 // the instance pointer may no longer be associated with a user object at this point.
 // If the instance pointer still has an associated channel, the channel is preempted and disabled.
 // Otherwise that must have already happened, so we just need to drop the ref counts on the resources
-void nvGpuOpsStopChannel(gpuRetainedChannel *retainedChannel,
-                         NvBool bImmediate)
+#include "nv_gpu_ops_stop_impl.h"
+
+static NV_STATUS nvGpuOpsStopChannelInternal(gpuRetainedChannel *retainedChannel,
+                                              NvBool bImmediate, NvBool bRevoke)
 {
     NV_STATUS status = NV_OK;
     nvGpuOpsLockSet acquiredLocks;
@@ -11205,25 +11752,26 @@ void nvGpuOpsStopChannel(gpuRetainedChannel *retainedChannel,
     KernelChannel *pKernelChannel = NULL;
     RsResourceRef *pResourceRef;
     RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    NVA06F_CTRL_STOP_CHANNEL_PARAMS stopChannelParams = {0};
 
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
 
-    if (_nvGpuOpsLocksAcquireAll(RMAPI_LOCK_FLAGS_READ,
-                                 retainedChannel->session->handle,
-                                 NULL,
-                                 &acquiredLocks) != NV_OK)
+    status = _nvGpuOpsLocksAcquireAll(RMAPI_LOCK_FLAGS_READ,
+                                      retainedChannel->session->handle,
+                                      NULL,
+                                      &acquiredLocks);
+    if (status != NV_OK)
     {
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
-        return;
+        return status;
     }
 
     status = nvGpuOpsGetChannelData(retainedChannel, &pKernelChannel);
     if (status != NV_OK)
     {
+        status = nvGpuOpsMissingChannelRevokeStatus(status, bRevoke);
         _nvGpuOpsLocksRelease(&acquiredLocks);
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
-        return;
+        return status;
     }
 
     // Verify this channel handle is still valid
@@ -11233,41 +11781,39 @@ void nvGpuOpsStopChannel(gpuRetainedChannel *retainedChannel,
         NV_ASSERT(0);
         _nvGpuOpsLocksRelease(&acquiredLocks);
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
-        return;
+        return status;
     }
 
-    stopChannelParams.bImmediate = bImmediate;
-    NV_ASSERT_OK(
-        pRmApi->Control(pRmApi,
-                        RES_GET_CLIENT_HANDLE(pKernelChannel),
-                        RES_GET_HANDLE(pKernelChannel),
-                        NVA06F_CTRL_CMD_STOP_CHANNEL,
-                        &stopChannelParams,
-                        sizeof(stopChannelParams)));
-
-    pKernelChannel->bIsContextBound = NV_FALSE;
-
-    if (retainedChannel->channelEngineType == UVM_GPU_CHANNEL_ENGINE_TYPE_GR)
-    {
-        NV2080_CTRL_GPU_EVICT_CTX_PARAMS params;
-
-        portMemSet(&params, 0, sizeof(params));
-        params.engineType = NV2080_ENGINE_TYPE_GR(0);
-        params.hClient = retainedChannel->session->handle;
-        params.hChanClient = RES_GET_CLIENT_HANDLE(pKernelChannel);
-        params.hObject = RES_GET_HANDLE(pKernelChannel);
-
-        NV_ASSERT_OK(
-            pRmApi->Control(pRmApi,
-                            retainedChannel->session->handle,
-                            retainedChannel->rmSubDevice->subDeviceHandle,
-                            NV2080_CTRL_CMD_GPU_EVICT_CTX,
-                            &params,
-                            sizeof(params)));
-    }
+#if defined(NV_SUNOS)
+    status = bRevoke ?
+        nvGpuOpsRevokeChannelControl(pRmApi, pKernelChannel, retainedChannel) :
+        nvGpuOpsStopChannelControl(pRmApi, pKernelChannel,
+                                   retainedChannel, bImmediate);
+#else
+    (void)bRevoke;
+    status = nvGpuOpsStopChannelControl(pRmApi, pKernelChannel,
+                                       retainedChannel, bImmediate);
+#endif
 
     _nvGpuOpsLocksRelease(&acquiredLocks);
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+NV_STATUS nvGpuOpsStopChannel(gpuRetainedChannel *retainedChannel,
+                              NvBool bImmediate)
+{
+    return nvGpuOpsStopChannelInternal(retainedChannel, bImmediate, NV_FALSE);
+}
+
+NV_STATUS nvGpuOpsRevokeChannel(gpuRetainedChannel *retainedChannel)
+{
+#if defined(NV_SUNOS)
+    return nvGpuOpsStopChannelInternal(retainedChannel, NV_FALSE, NV_TRUE);
+#else
+    (void)retainedChannel;
+    return NV_ERR_NOT_SUPPORTED;
+#endif
 }
 
 // Make sure the UVM and PMA structs are in sync

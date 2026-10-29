@@ -279,6 +279,10 @@ struct linux_file {
     uint_t                          f_count;    /* open + segments + holds */
     boolean_t                       f_open;     /* between open and close */
     boolean_t                       f_poll_queued;
+    boolean_t                       f_finish_deferred;
+    boolean_t                       f_finish_ready;
+    boolean_t                       f_release_called;
+    boolean_t                       f_finish_queued;
     struct uvm_acct_owner          *f_acct;     /* the opener */
     struct pollhead                 f_pollhead;
     list_node_t                     f_release_link;

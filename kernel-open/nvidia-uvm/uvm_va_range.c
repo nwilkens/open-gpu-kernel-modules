@@ -36,6 +36,7 @@
 #include "uvm_va_block.h"
 #include "uvm_kvmalloc.h"
 #include "uvm_map_external.h"
+#include "uvm_import_platform_impl.h"
 #include "uvm_va_range_dmabuf.h"
 #include "uvm_perf_thrashing.h"
 #include "nv_uvm_interface.h"
@@ -591,31 +592,57 @@ static void uvm_va_range_destroy_managed(uvm_va_range_managed_t *managed_range)
     kmem_cache_free(g_uvm_va_range_managed_cache, managed_range);
 }
 
-static void uvm_va_range_destroy_external(uvm_va_range_external_t *external_range, struct list_head *deferred_free_list)
+static NV_STATUS uvm_va_range_destroy_external(uvm_va_range_external_t *external_range, struct list_head *deferred_free_list)
 {
     uvm_gpu_t *gpu;
-
-    uvm_processor_mask_cache_free(external_range->retained_mask);
 
     if (uvm_processor_mask_empty(&external_range->mapped_gpus))
         goto out;
 
     UVM_ASSERT(deferred_free_list);
 
+    if (uvm_import_tracking_enabled()) {
+        /* Checked teardown cannot run under the VA writer lock. */
+        for_each_va_space_gpu_in_mask(gpu, external_range->va_range.va_space,
+                                      &external_range->mapped_gpus) {
+            uvm_ext_gpu_range_tree_t *tree = uvm_ext_gpu_range_tree(external_range,
+                                                                      gpu);
+            bool tracked;
+
+            uvm_mutex_lock(&tree->lock);
+            tracked = uvm_ext_gpu_range_has_tracked_import(external_range, gpu);
+            uvm_mutex_unlock(&tree->lock);
+            if (tracked)
+                return NV_ERR_INVALID_STATE;
+        }
+    }
+
     for_each_va_space_gpu_in_mask(gpu, external_range->va_range.va_space, &external_range->mapped_gpus) {
         uvm_ext_gpu_range_tree_t *range_tree = uvm_ext_gpu_range_tree(external_range, gpu);
         uvm_ext_gpu_map_t *ext_map, *ext_map_next;
 
         uvm_mutex_lock(&range_tree->lock);
-        uvm_ext_gpu_map_for_each_safe(ext_map, ext_map_next, external_range, gpu)
-            uvm_ext_gpu_map_destroy(external_range, ext_map, deferred_free_list);
+        uvm_ext_gpu_map_for_each_safe(ext_map, ext_map_next, external_range, gpu) {
+            NV_STATUS status = uvm_ext_gpu_map_destroy(external_range, ext_map,
+                                                        deferred_free_list);
+            if (status != NV_OK) {
+                uvm_mutex_unlock(&range_tree->lock);
+                return status;
+            }
+        }
         uvm_mutex_unlock(&range_tree->lock);
     }
 
     UVM_ASSERT(uvm_processor_mask_empty(&external_range->mapped_gpus));
 
 out:
+    if (uvm_import_tracking_enabled() &&
+        !RB_EMPTY_NODE(&external_range->va_range.node.rb_node))
+        uvm_range_tree_remove(&external_range->va_range.va_space->va_range_tree,
+                              &external_range->va_range.node);
+    uvm_processor_mask_cache_free(external_range->retained_mask);
     kmem_cache_free(g_uvm_va_range_external_cache, external_range);
+    return NV_OK;
 }
 
 #if UVM_PROVIDES_DMA_BUF_IMPORTER()
@@ -695,11 +722,14 @@ static void uvm_va_range_destroy_semaphore_pool(uvm_va_range_semaphore_pool_t *s
     kmem_cache_free(g_uvm_va_range_semaphore_pool_cache, semaphore_pool_range);
 }
 
-void uvm_va_range_destroy(uvm_va_range_t *va_range, struct list_head *deferred_free_list)
+NV_STATUS uvm_va_range_destroy(uvm_va_range_t *va_range,
+                               struct list_head *deferred_free_list)
 {
     UVM_ASSERT(va_range);
 
-    if (!RB_EMPTY_NODE(&va_range->node.rb_node))
+    if (uvm_external_range_remove_before_destroy(
+            va_range->type == UVM_VA_RANGE_TYPE_EXTERNAL) &&
+        !RB_EMPTY_NODE(&va_range->node.rb_node))
         uvm_range_tree_remove(&va_range->va_space->va_range_tree, &va_range->node);
 
     switch (va_range->type) {
@@ -708,34 +738,35 @@ void uvm_va_range_destroy(uvm_va_range_t *va_range, struct list_head *deferred_f
             break;
         case UVM_VA_RANGE_TYPE_MANAGED:
             uvm_va_range_destroy_managed(uvm_va_range_to_managed(va_range));
-            return;
+            return NV_OK;
         case UVM_VA_RANGE_TYPE_EXTERNAL:
-            uvm_va_range_destroy_external(uvm_va_range_to_external(va_range), deferred_free_list);
-            return;
+            return uvm_va_range_destroy_external(uvm_va_range_to_external(va_range),
+                                                 deferred_free_list);
         case UVM_VA_RANGE_TYPE_DMA_BUF:
 #if !UVM_PROVIDES_DMA_BUF_IMPORTER()
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] unexpected DMA_BUF range\n",
                            va_range->node.start, va_range->node.end);
 #endif
             uvm_va_range_destroy_dma_buf(uvm_va_range_to_dma_buf(va_range), deferred_free_list);
-            return;
+            return NV_OK;
         case UVM_VA_RANGE_TYPE_CHANNEL:
             uvm_va_range_destroy_channel(uvm_va_range_to_channel(va_range));
-            return;
+            return NV_OK;
         case UVM_VA_RANGE_TYPE_SKED_REFLECTED:
             uvm_va_range_destroy_sked_reflected(uvm_va_range_to_sked_reflected(va_range));
-            return;
+            return NV_OK;
         case UVM_VA_RANGE_TYPE_SEMAPHORE_POOL:
             uvm_va_range_destroy_semaphore_pool(uvm_va_range_to_semaphore_pool(va_range));
-            return;
+            return NV_OK;
         case UVM_VA_RANGE_TYPE_DEVICE_P2P:
             unmap_mapping_range(va_range->va_space->mapping, va_range->node.start, uvm_va_range_size(va_range), 1);
             uvm_va_range_destroy_device_p2p(uvm_va_range_to_device_p2p(va_range), deferred_free_list);
-            return;
+            return NV_OK;
         default:
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] has type %d\n",
                            va_range->node.start, va_range->node.end, va_range->type);
     }
+    return NV_OK;
 }
 
 void uvm_va_range_zombify(uvm_va_range_managed_t *managed_range)
@@ -809,6 +840,7 @@ static NV_STATUS uvm_free(uvm_va_space_t *va_space, NvU64 base)
     NV_STATUS status = NV_OK;
     uvm_processor_mask_t *retained_mask = NULL;
     uvm_gpu_t *retained_gpu = NULL;
+    bool retained_mask_restored = false;
     LIST_HEAD(deferred_free_list);
 
     uvm_va_space_down_write(va_space);
@@ -847,7 +879,11 @@ static NV_STATUS uvm_free(uvm_va_space_t *va_space, NvU64 base)
     if (status != NV_OK)
         goto out;
 
-    uvm_va_range_destroy(va_range, &deferred_free_list);
+    status = uvm_va_range_destroy(va_range, &deferred_free_list);
+    if (status != NV_OK && va_range->type == UVM_VA_RANGE_TYPE_EXTERNAL) {
+        uvm_va_range_to_external(va_range)->retained_mask = retained_mask;
+        retained_mask_restored = true;
+    }
 
     // If there is deferred work, retain the required GPUs.
     if (!list_empty(&deferred_free_list)) {
@@ -861,7 +897,6 @@ out:
     uvm_va_space_up_write(va_space);
 
     if (!list_empty(&deferred_free_list)) {
-        UVM_ASSERT(status == NV_OK);
         uvm_deferred_free_object_list(&deferred_free_list);
         if (retained_mask)
             uvm_global_gpu_release(retained_mask);
@@ -871,7 +906,8 @@ out:
 
     // Free the mask allocated in uvm_va_range_create_external() since
     // uvm_va_range_destroy() won't free this mask.
-    uvm_processor_mask_cache_free(retained_mask);
+    if (!retained_mask_restored)
+        uvm_processor_mask_cache_free(retained_mask);
 
     return status;
 }
@@ -1464,22 +1500,34 @@ static void va_range_remove_gpu_va_space_managed(uvm_va_range_managed_t *managed
     }
 }
 
-static void va_range_remove_gpu_va_space_external(uvm_va_range_external_t *external_range,
-                                                  uvm_gpu_t *gpu,
-                                                  struct list_head *deferred_free_list)
+static NV_STATUS va_range_remove_gpu_va_space_external(uvm_va_range_external_t *external_range,
+                                                        uvm_gpu_t *gpu,
+                                                        struct list_head *deferred_free_list)
 {
     uvm_ext_gpu_range_tree_t *range_tree;
     uvm_ext_gpu_map_t *ext_map, *ext_map_next;
+    NV_STATUS status = NV_OK;
 
     UVM_ASSERT(deferred_free_list);
 
     range_tree = uvm_ext_gpu_range_tree(external_range, gpu);
     uvm_mutex_lock(&range_tree->lock);
 
-    uvm_ext_gpu_map_for_each_safe(ext_map, ext_map_next, external_range, gpu)
-        uvm_ext_gpu_map_destroy(external_range, ext_map, deferred_free_list);
+    if (uvm_ext_gpu_range_has_tracked_import(external_range, gpu)) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
 
+    uvm_ext_gpu_map_for_each_safe(ext_map, ext_map_next, external_range, gpu) {
+        status = uvm_ext_gpu_map_destroy(external_range, ext_map,
+                                          deferred_free_list);
+        if (status != NV_OK)
+            break;
+    }
+
+out:
     uvm_mutex_unlock(&range_tree->lock);
+    return status;
 }
 
 static void va_range_remove_gpu_va_space_dma_buf(uvm_va_range_dma_buf_t *dmabuf_range,
@@ -1499,20 +1547,19 @@ static void va_range_remove_gpu_va_space_semaphore_pool(uvm_va_range_semaphore_p
         uvm_mem_unmap_gpu_user(semaphore_pool_range->mem, gpu);
 }
 
-void uvm_va_range_remove_gpu_va_space(uvm_va_range_t *va_range,
-                                      uvm_gpu_va_space_t *gpu_va_space,
-                                      struct mm_struct *mm,
-                                      struct list_head *deferred_free_list)
+NV_STATUS uvm_va_range_remove_gpu_va_space(uvm_va_range_t *va_range,
+                                           uvm_gpu_va_space_t *gpu_va_space,
+                                           struct mm_struct *mm,
+                                           struct list_head *deferred_free_list)
 {
     switch (va_range->type) {
         case UVM_VA_RANGE_TYPE_MANAGED:
             va_range_remove_gpu_va_space_managed(uvm_va_range_to_managed(va_range), gpu_va_space, mm);
             break;
         case UVM_VA_RANGE_TYPE_EXTERNAL:
-            va_range_remove_gpu_va_space_external(uvm_va_range_to_external(va_range),
-                                                  gpu_va_space->gpu,
-                                                  deferred_free_list);
-            break;
+            return va_range_remove_gpu_va_space_external(uvm_va_range_to_external(va_range),
+                                                          gpu_va_space->gpu,
+                                                          deferred_free_list);
         case UVM_VA_RANGE_TYPE_DMA_BUF:
 #if !UVM_PROVIDES_DMA_BUF_IMPORTER()
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] unexpected DMA_BUF range\n",
@@ -1547,6 +1594,7 @@ void uvm_va_range_remove_gpu_va_space(uvm_va_range_t *va_range,
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] has type %d\n",
                            va_range->node.start, va_range->node.end, va_range->type);
     }
+    return NV_OK;
 }
 
 static NV_STATUS uvm_va_range_enable_peer_managed(uvm_va_range_managed_t *managed_range,
@@ -1609,23 +1657,33 @@ NV_STATUS uvm_va_range_enable_peer(uvm_va_range_t *va_range, uvm_gpu_t *gpu0, uv
     }
 }
 
-static void uvm_va_range_disable_peer_external(uvm_va_range_external_t *external_range,
-                                               uvm_gpu_t *mapping_gpu,
-                                               uvm_gpu_t *owning_gpu,
-                                               struct list_head *deferred_free_list)
+static NV_STATUS uvm_va_range_disable_peer_external(uvm_va_range_external_t *external_range,
+                                                     uvm_gpu_t *mapping_gpu,
+                                                     uvm_gpu_t *owning_gpu,
+                                                     struct list_head *deferred_free_list)
 {
     uvm_ext_gpu_range_tree_t *range_tree;
     uvm_ext_gpu_map_t *ext_map, *ext_map_next;
+    NV_STATUS status = NV_OK;
 
     range_tree = uvm_ext_gpu_range_tree(external_range, mapping_gpu);
     uvm_mutex_lock(&range_tree->lock);
+    if (uvm_ext_gpu_range_has_tracked_import(external_range, mapping_gpu)) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
     uvm_ext_gpu_map_for_each_safe(ext_map, ext_map_next, external_range, mapping_gpu) {
         if (ext_map->owning_gpu == owning_gpu && (!ext_map->is_sysmem || ext_map->is_egm)) {
             UVM_ASSERT(deferred_free_list);
-            uvm_ext_gpu_map_destroy(external_range, ext_map, deferred_free_list);
+            status = uvm_ext_gpu_map_destroy(external_range, ext_map,
+                                              deferred_free_list);
+            if (status != NV_OK)
+                break;
         }
     }
+out:
     uvm_mutex_unlock(&range_tree->lock);
+    return status;
 }
 
 static void uvm_va_range_disable_peer_managed(uvm_va_range_managed_t *managed_range, uvm_gpu_t *gpu0, uvm_gpu_t *gpu1)
@@ -1639,10 +1697,10 @@ static void uvm_va_range_disable_peer_managed(uvm_va_range_managed_t *managed_ra
     }
 }
 
-void uvm_va_range_disable_peer(uvm_va_range_t *va_range,
-                               uvm_gpu_t *gpu0,
-                               uvm_gpu_t *gpu1,
-                               struct list_head *deferred_free_list)
+NV_STATUS uvm_va_range_disable_peer(uvm_va_range_t *va_range,
+                                    uvm_gpu_t *gpu0,
+                                    uvm_gpu_t *gpu1,
+                                    struct list_head *deferred_free_list)
 {
 
     switch (va_range->type) {
@@ -1651,9 +1709,17 @@ void uvm_va_range_disable_peer(uvm_va_range_t *va_range,
             break;
         case UVM_VA_RANGE_TYPE_EXTERNAL:
             // If GPU 0 has a mapping to GPU 1, remove GPU 0's mapping
-            uvm_va_range_disable_peer_external(uvm_va_range_to_external(va_range), gpu0, gpu1, deferred_free_list);
+            {
+                NV_STATUS status = uvm_va_range_disable_peer_external(
+                    uvm_va_range_to_external(va_range), gpu0, gpu1,
+                    deferred_free_list);
+                if (status != NV_OK)
+                    return status;
+            }
             // If GPU 1 has a mapping to GPU 0, remove GPU 1's mapping
-            uvm_va_range_disable_peer_external(uvm_va_range_to_external(va_range), gpu1, gpu0, deferred_free_list);
+            return uvm_va_range_disable_peer_external(
+                uvm_va_range_to_external(va_range), gpu1, gpu0,
+                deferred_free_list);
             break;
         case UVM_VA_RANGE_TYPE_DMA_BUF:
             // UVM_VA_RANGE_TYPE_DMA_BUF should never have peer mappings
@@ -1674,6 +1740,7 @@ void uvm_va_range_disable_peer(uvm_va_range_t *va_range,
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] has type %d\n",
                            va_range->node.start, va_range->node.end, va_range->type);
     }
+    return NV_OK;
 }
 
 static NV_STATUS va_range_register_gpu_semaphore_pool(uvm_va_range_semaphore_pool_t *semaphore_pool_range,
@@ -1716,12 +1783,29 @@ static void va_range_unregister_gpu_managed(uvm_va_range_managed_t *managed_rang
 // were removed when the corresponding GPU VA space was removed. However, other
 // GPUs could still have mappings to memory resident on this GPU, so we have to
 // unmap those.
-static void va_range_unregister_gpu_external(uvm_va_range_external_t *external_range,
-                                             uvm_gpu_t *gpu,
-                                             struct list_head *deferred_free_list)
+static NV_STATUS va_range_unregister_gpu_external(uvm_va_range_external_t *external_range,
+                                                   uvm_gpu_t *gpu,
+                                                   struct list_head *deferred_free_list)
 {
     uvm_ext_gpu_map_t *ext_map, *ext_map_next;
     uvm_gpu_t *other_gpu;
+    NV_STATUS status = NV_OK;
+
+    for_each_va_space_gpu_in_mask(other_gpu, external_range->va_range.va_space,
+                                  &external_range->mapped_gpus) {
+        uvm_ext_gpu_range_tree_t *tree = uvm_ext_gpu_range_tree(external_range,
+                                                                  other_gpu);
+        bool tracked;
+
+        if (other_gpu == gpu)
+            continue;
+        uvm_mutex_lock(&tree->lock);
+        tracked = uvm_ext_gpu_range_has_tracked_import(external_range,
+                                                        other_gpu);
+        uvm_mutex_unlock(&tree->lock);
+        if (tracked)
+            return NV_ERR_INVALID_STATE;
+    }
 
     for_each_va_space_gpu_in_mask(other_gpu, external_range->va_range.va_space, &external_range->mapped_gpus) {
         uvm_ext_gpu_range_tree_t *range_tree = uvm_ext_gpu_range_tree(external_range, other_gpu);
@@ -1731,11 +1815,17 @@ static void va_range_unregister_gpu_external(uvm_va_range_external_t *external_r
         uvm_ext_gpu_map_for_each_safe(ext_map, ext_map_next, external_range, other_gpu) {
             if (ext_map->owning_gpu == gpu) {
                 UVM_ASSERT(deferred_free_list);
-                uvm_ext_gpu_map_destroy(external_range, ext_map, deferred_free_list);
+                status = uvm_ext_gpu_map_destroy(external_range, ext_map,
+                                                  deferred_free_list);
+                if (status != NV_OK) {
+                    uvm_mutex_unlock(&range_tree->lock);
+                    return status;
+                }
             }
         }
         uvm_mutex_unlock(&range_tree->lock);
     }
+    return NV_OK;
 }
 
 static void va_range_unregister_gpu_semaphore_pool(uvm_va_range_semaphore_pool_t *semaphore_pool_range,
@@ -1761,18 +1851,18 @@ static void va_range_unregister_gpu_semaphore_pool(uvm_va_range_semaphore_pool_t
         semaphore_pool_range->owner = NULL;
 }
 
-void uvm_va_range_unregister_gpu(uvm_va_range_t *va_range,
-                                 uvm_gpu_t *gpu,
-                                 struct mm_struct *mm,
-                                 struct list_head *deferred_free_list)
+NV_STATUS uvm_va_range_unregister_gpu(uvm_va_range_t *va_range,
+                                      uvm_gpu_t *gpu,
+                                      struct mm_struct *mm,
+                                      struct list_head *deferred_free_list)
 {
     switch (va_range->type) {
         case UVM_VA_RANGE_TYPE_MANAGED:
             va_range_unregister_gpu_managed(uvm_va_range_to_managed(va_range), gpu, mm);
             break;
         case UVM_VA_RANGE_TYPE_EXTERNAL:
-            va_range_unregister_gpu_external(uvm_va_range_to_external(va_range), gpu, deferred_free_list);
-            break;
+            return va_range_unregister_gpu_external(uvm_va_range_to_external(va_range),
+                                                     gpu, deferred_free_list);
         case UVM_VA_RANGE_TYPE_DMA_BUF:
 #if !UVM_PROVIDES_DMA_BUF_IMPORTER()
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] unexpected DMA_BUF range\n",
@@ -1810,6 +1900,7 @@ void uvm_va_range_unregister_gpu(uvm_va_range_t *va_range,
             UVM_ASSERT_MSG(0, "[0x%llx, 0x%llx] has type %d\n",
                            va_range->node.start, va_range->node.end, va_range->type);
     }
+    return NV_OK;
 }
 
 // Split existing's blocks into new. new's blocks array has already been

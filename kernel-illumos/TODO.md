@@ -1,10 +1,11 @@
 # illumos port: open work
 
-Everything here builds and links, but nothing has run on a GPU yet.
+The four modules have loaded on SmartOS with an RTX 4060 Ti. CUDA decode,
+NVENC encode, and an interrupted LX-zone stop passed on one host and kernel.
+Those tests do not cover every RM failure path or untrusted-zone operation.
 
-## Needs a GPU
+## Needs wider GPU validation
 
-- Load all four modules, open every device node, and run a CUDA program.
 - Run the UVM builtin tests (`uvm_enable_builtin_tests=1`).
 - Measure the real kernel stack high-water mark on the UVM fault and ioctl
   paths. The static estimates are 15 to 19 KB of the 20 KB default stack;
@@ -16,16 +17,31 @@ Everything here builds and links, but nothing has run on a GPU yet.
 
 ## Design decisions still open
 
-- RM-pinned user memory (`cudaHostRegister`): a munmap of the range without
-  unregistering it hangs uninterruptibly, because an illumos pagelock cannot
-  outlive its mapping and RM cannot revoke GPU access. Process exit hangs
-  the same way, because the device close waits for its mappings to go and
-  `as_free` runs the umem callbacks first; halting a zone with a running
-  NVENC or CUDA job leaves the zone stuck until the host reboots. The fix is
-  RM-coordinated revocation from the umem cleanup callback, as hermon does.
-  The alternative is to refuse these registrations.
-- CUDA user libraries exist only for Linux. Running them in LX zones needs
-  nvidia ioctl and mmap passthrough in the lx brand.
+- RM-pinned user memory (`cudaHostRegister`) has checked UVM import teardown
+  for the observed interrupted NVENC zone stop. The callback retains the pin
+  if GPU or IOMMU removal fails. Ordinary RM duplicates and virtual-memory
+  DMA mappings of a tracked pin are refused before they can acquire an
+  untracked reference; UVM's own tracked duplicate and mapping client are
+  admitted. Other RM mapping paths still need an ownership audit.
+- A raw RM channel can share a UVM VA space without appearing in UVM's
+  registered-channel list. On illumos, RM now refuses GPFIFO scheduling or
+  BIND of an unbound user channel in an externally owned VA space, including
+  CE channels. BIND needed its own gate because it can schedule without a
+  separate GPFIFO schedule control.
+  UVM-owned kernel channels remain schedulable. The callback certifies only
+  raw channels that were never bound and have no failed-revoke bit; any other
+  unrevoked channel retains the pin. A direct BIND attempt on an eligible
+  channel in a disposable LX zone returned `NV_ERR_INVALID_STATE` before UVM
+  registration on one GPU. The follow-up wrapper preflight that avoids an
+  assertion-style log for that expected denial has passed focused tests and
+  a SmartOS module build, but has not yet booted. An adversarial untrusted-zone
+  test and an audit of alternate submission paths are still needed before
+  claiming complete isolation.
+- CUDA user libraries exist only for Linux. Companion illumos-joyent PR #564
+  supplies the LX ioctl, device identity, and procfs behavior needed by those
+  libraries; CUDA decode and NVENC passed with it on one SmartOS host. The LX
+  change is not yet merged, and device assignment does not establish safe
+  sharing with untrusted zones.
 
 ## Known gaps
 

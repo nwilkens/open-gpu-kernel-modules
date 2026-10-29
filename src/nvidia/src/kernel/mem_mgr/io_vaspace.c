@@ -582,6 +582,8 @@ iovaspaceReleaseMapping_IMPL
     iovaspaceDestroyMapping(pIOVAS, pIovaMapping);
 }
 
+#include "io_vaspace_checked_impl.h"
+
 OBJIOVASPACE *iovaspaceFromId(NvU32 iovaspaceId)
 {
     OBJVASPACE *pVAS;

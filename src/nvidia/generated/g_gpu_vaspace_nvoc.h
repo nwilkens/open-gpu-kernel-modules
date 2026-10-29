@@ -256,6 +256,9 @@ struct OBJGVASPACE {
     NvU32 numPartialPtRanges;
     NvBool bIsFaultCapable;
     NvBool bIsExternallyOwned;
+#if defined(NV_SUNOS)
+    volatile NvU32 uvmRevoked;
+#endif
     MEMORY_DESCRIPTOR *pExternalPDB;
     NvBool bIsAtsEnabled;
     NvU32 processAddrSpaceId;

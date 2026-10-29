@@ -2099,6 +2099,8 @@ void uvm_page_table_range_vec_deinit(uvm_page_table_range_vec_t *range_vec)
     memset(range_vec, 0, sizeof(*range_vec));
 }
 
+#include "uvm_mmu_deinit_checked_impl.h"
+
 void uvm_page_table_range_vec_destroy(uvm_page_table_range_vec_t *range_vec)
 {
     if (!range_vec)

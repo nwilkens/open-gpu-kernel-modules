@@ -526,6 +526,11 @@ NV_STATUS uvm_page_table_range_vec_split_upper(uvm_page_table_range_vec_t *range
 // Put all the PTEs that the range vector covered.
 void uvm_page_table_range_vec_deinit(uvm_page_table_range_vec_t *range_vec);
 
+// Checked release for an external map. put_queued survives a failed wait so a
+// retry does not queue the same page-table references twice.
+NV_STATUS uvm_page_table_range_vec_deinit_checked(
+    uvm_page_table_range_vec_t *range_vec, bool *put_queued);
+
 // Deinitialize and free a page table range vector.
 void uvm_page_table_range_vec_destroy(uvm_page_table_range_vec_t *range_vec);
 

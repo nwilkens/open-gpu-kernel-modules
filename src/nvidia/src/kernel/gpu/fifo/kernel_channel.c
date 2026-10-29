@@ -206,6 +206,9 @@ kchannelConstruct_IMPL
 
     pKernelChannel->refCount = 1;
     pKernelChannel->bIsContextBound = NV_FALSE;
+#if defined(NV_SUNOS)
+    pKernelChannel->uvmRevoked = 0;
+#endif
     pKernelChannel->nextObjectClassID = 0;
     pKernelChannel->subctxId = 0;
     pKernelChannel->vaSpaceId = 0;
@@ -2128,6 +2131,26 @@ kchannelIsSchedulable_IMPL
     NvU32        engineDesc = 0;
     NvU32        gfId;
 
+#if defined(NV_SUNOS)
+    if (portAtomicOrU32(&pKernelChannel->uvmRevoked, 0) != 0)
+        return NV_FALSE;
+#endif
+    pGVAS = dynamicCast(pKernelChannel->pVAS, OBJGVASPACE);
+#if defined(NV_SUNOS)
+    if (pGVAS != NULL && portAtomicOrU32(&pGVAS->uvmRevoked, 0) != 0)
+        return NV_FALSE;
+
+    /* An unregistered user channel must never run in an imported VA space. */
+    if (pGVAS != NULL && gvaspaceIsExternallyOwned(pGVAS) &&
+        !pKernelChannel->bUvmOwned && !pKernelChannel->bIsContextBound)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+            "Cannot schedule externally-owned " FMT_CHANNEL_DEBUG_TAG " before UVM registration!\n",
+            kchannelGetDebugTag(pKernelChannel));
+        return NV_FALSE;
+    }
+#endif
+
     gfId = kchannelGetGfid(pKernelChannel);
     if (IS_GFID_VF(gfId))
     {
@@ -2136,8 +2159,6 @@ kchannelIsSchedulable_IMPL
             kchannelGetDebugTag(pKernelChannel));
         return NV_TRUE;
     }
-
-    pGVAS = dynamicCast(pKernelChannel->pVAS, OBJGVASPACE);
 
     //
     // It should be an error to have allocated and attempt to schedule a
@@ -2841,6 +2862,20 @@ NV_STATUS kchannelBindToRunlist_IMPL
     NV_STATUS status = NV_OK;
 
     NV_ASSERT_OR_RETURN(pKernelChannel != NULL, NV_ERR_INVALID_ARGUMENT);
+#if defined(NV_SUNOS)
+    if (portAtomicOrU32(&pKernelChannel->uvmRevoked, 0) != 0)
+        return NV_ERR_INVALID_STATE;
+    {
+        OBJGVASPACE *pGVAS = dynamicCast(pKernelChannel->pVAS, OBJGVASPACE);
+        if (pGVAS != NULL && portAtomicOrU32(&pGVAS->uvmRevoked, 0) != 0)
+            return NV_ERR_INVALID_STATE;
+
+        /* BIND can schedule a channel without GPFIFO_SCHEDULE. */
+        if (pGVAS != NULL && gvaspaceIsExternallyOwned(pGVAS) &&
+            !pKernelChannel->bUvmOwned && !pKernelChannel->bIsContextBound)
+            return NV_ERR_INVALID_STATE;
+    }
+#endif
     pGpu = GPU_RES_GET_GPU(pKernelChannel);
     pKernelFifo = GPU_GET_KERNEL_FIFO(pGpu);
 
@@ -3161,6 +3196,21 @@ kchannelCtrlCmdBind_IMPL
 
     if (!pParams)
         return NV_ERR_INVALID_ARGUMENT;
+
+#if defined(NV_SUNOS)
+    if (portAtomicOrU32(&pKernelChannel->uvmRevoked, 0) != 0)
+        return NV_ERR_INVALID_STATE;
+    {
+        OBJGVASPACE *pGVAS = dynamicCast(pKernelChannel->pVAS, OBJGVASPACE);
+        if (pGVAS != NULL && portAtomicOrU32(&pGVAS->uvmRevoked, 0) != 0)
+            return NV_ERR_INVALID_STATE;
+
+        /* An expected user denial must not trip the bind assertion below. */
+        if (pGVAS != NULL && gvaspaceIsExternallyOwned(pGVAS) &&
+            !pKernelChannel->bUvmOwned && !pKernelChannel->bIsContextBound)
+            return NV_ERR_INVALID_STATE;
+    }
+#endif
 
     // Check if channel belongs to TSG that is not internal RM TSG
     if (!pKernelChannel->pKernelChannelGroupApi->pKernelChannelGroup->bAllocatedByRm)

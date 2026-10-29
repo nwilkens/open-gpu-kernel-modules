@@ -36,6 +36,7 @@
 #include "uvm_hal.h"
 #include "uvm_hal_types.h"
 #include "uvm_map_external.h"
+#include "uvm_import_platform_impl.h"
 #include "uvm_pte_batch.h"
 #include "uvm_tlb_batch.h"
 #include "nv_uvm_interface.h"
@@ -43,6 +44,95 @@
 #include "nv_uvm_user_types.h"
 
 #include "uvm_pushbuffer.h"
+
+typedef enum {
+    UVM_IMPORT_BUILDING,
+    UVM_IMPORT_ACTIVE,
+    UVM_IMPORT_NORMAL_FRAGMENT,
+    UVM_IMPORT_NORMAL_FINALIZING,
+    UVM_IMPORT_REVOKING,
+    UVM_IMPORT_COMPLETE,
+    UVM_IMPORT_FAILED,
+} uvm_import_state_t;
+
+struct uvm_ext_gpu_import_owner {
+    struct list_head va_node;
+    atomic_t refs;
+    uvm_va_space_t *va_space;
+    uvm_gpu_t *gpu;
+    uvm_ext_gpu_mem_handle *mem_handle;
+    void *token;
+    atomic_t state;
+    wait_queue_head_t state_waitq;
+    nv_kthread_q_item_t finalize_item;
+    NV_STATUS failure;
+};
+
+static atomic_t g_uvm_import_owner_count = ATOMIC_INIT(0);
+
+static NV_STATUS uvm_ext_gpu_import_owner_revoke(void *opaque);
+static void uvm_ext_gpu_import_owner_finalize(void *opaque);
+
+static void uvm_import_owner_put(struct uvm_ext_gpu_import_owner *owner)
+{
+    if (atomic_dec_and_test(&owner->refs)) {
+        atomic_dec(&g_uvm_import_owner_count);
+        uvm_kvfree(owner);
+    }
+}
+
+int uvm_ext_gpu_import_busy(void)
+{
+    return atomic_read(&g_uvm_import_owner_count) != 0;
+}
+
+static void uvm_import_owner_set_state(struct uvm_ext_gpu_import_owner *owner,
+                                        uvm_import_state_t state)
+{
+    atomic_set(&owner->state, state);
+    wake_up_all(&owner->state_waitq);
+}
+
+static void uvm_import_owner_mark_failed(struct uvm_ext_gpu_import_owner *owner,
+                                          NV_STATUS status)
+{
+    owner->failure = status;
+    UVM_ERR_PRINT_ALWAYS("Checked NVIDIA import owner failed: %s\n",
+                         nvstatusToString(status));
+    uvm_import_owner_set_state(owner, UVM_IMPORT_FAILED);
+}
+
+static void uvm_import_owner_finish(struct uvm_ext_gpu_import_owner *owner,
+                                     bool defer_free)
+{
+    uvm_va_space_t *va_space = owner->va_space;
+
+    uvm_import_owner_set_state(owner, UVM_IMPORT_COMPLETE);
+    uvm_spin_lock(&va_space->import_owner_lock);
+    list_del_init(&owner->va_node);
+    uvm_spin_unlock(&va_space->import_owner_lock);
+    uvm_gpu_release(owner->gpu);
+
+    /* The destroy path takes this lock before deciding that a zero count
+     * permits freeing the VA space. Queue the resume while it is still held:
+     * after the unlock, this finalizer must not touch va_space again. */
+    uvm_spin_lock(&va_space->import_owner_lock);
+    if (atomic_dec_and_test(&va_space->import_owner_count))
+        uvm_va_space_resume_import_release(va_space);
+    uvm_spin_unlock(&va_space->import_owner_lock);
+
+    if (defer_free) {
+        /* The registry's callback stack still has the owner argument. */
+        nv_kthread_q_item_init(&owner->finalize_item,
+                               uvm_ext_gpu_import_owner_finalize, owner);
+        if (!nv_kthread_q_schedule_q_item(&g_uvm_global.deferred_release_q,
+                                           &owner->finalize_item))
+            UVM_ERR_PRINT("Import owner free could not be queued\n");
+    }
+    else {
+        uvm_import_owner_put(owner);
+    }
+}
 
 // Assume almost all of the push space can be used for PTEs leaving 1K of margin.
 #define MAX_COPY_SIZE_PER_PUSH ((size_t)(UVM_MAX_PUSH_SIZE - 1024))
@@ -591,6 +681,8 @@ static void uvm_release_rm_handle(struct nv_kref *ref)
     uvm_kvfree(mem_handle);
 }
 
+#include "uvm_map_external_handle_checked_impl.h"
+
 static NV_STATUS uvm_create_external_range(uvm_va_space_t *va_space, UVM_CREATE_EXTERNAL_RANGE_PARAMS *params)
 {
     uvm_va_range_external_t *external_range = NULL;
@@ -840,7 +932,9 @@ static NV_STATUS uvm_unmap_external_in_range(uvm_va_range_external_t *external_r
                 ext_map_next = uvm_ext_gpu_map_iter_next(external_range, ext_map, end);
             }
 
-            uvm_ext_gpu_map_destroy(external_range, ext_map, deferred_list);
+            status = uvm_ext_gpu_map_destroy(external_range, ext_map, deferred_list);
+            if (status != NV_OK)
+                break;
         }
 
         ext_map = ext_map_next;
@@ -859,6 +953,8 @@ static NV_STATUS uvm_map_external_allocation_on_gpu(uvm_va_range_external_t *ext
 {
     uvm_va_space_t *va_space = external_range->va_range.va_space;
     uvm_ext_gpu_map_t *ext_gpu_map = NULL;
+    struct uvm_ext_gpu_import_owner *import_owner = NULL;
+    void *import_token = NULL;
     uvm_ext_gpu_range_tree_t *range_tree = uvm_ext_gpu_range_tree(external_range, mapping_gpu);
     UvmGpuMemoryInfo mem_info;
     uvm_gpu_va_space_t *gpu_va_space = uvm_gpu_va_space_get(va_space, mapping_gpu);
@@ -898,6 +994,22 @@ static NV_STATUS uvm_map_external_allocation_on_gpu(uvm_va_range_external_t *ext
         goto error;
     }
 
+    /* Only illumos can return a tracked OS-descriptor import token. */
+    if (uvm_import_tracking_enabled()) {
+        import_owner = uvm_kvmalloc_zero(sizeof(*import_owner));
+        if (!import_owner) {
+            status = NV_ERR_NO_MEMORY;
+            goto error;
+        }
+        import_owner->va_space = va_space;
+        import_owner->gpu = mapping_gpu;
+        import_owner->mem_handle = ext_gpu_map->mem_handle;
+        INIT_LIST_HEAD(&import_owner->va_node);
+        atomic_set(&import_owner->refs, 1);
+        atomic_set(&import_owner->state, UVM_IMPORT_BUILDING);
+        init_waitqueue_head(&import_owner->state_waitq);
+    }
+
     // Due to the fact that any overlapping mappings were already unmapped,
     // adding the new mapping to the tree cannot fail.
     status = uvm_range_tree_add(&range_tree->tree, &ext_gpu_map->base.node);
@@ -915,11 +1027,17 @@ static NV_STATUS uvm_map_external_allocation_on_gpu(uvm_va_range_external_t *ext
     // Dup the memory. This verifies the input handles, takes a ref count on the
     // physical allocation so it can't go away under us, and returns us the
     // allocation info.
-    status = uvm_rm_locked_call(nvUvmInterfaceDupMemory(uvm_gpu_device_handle(mapping_gpu),
-                                                        user_rm_mem->user_client,
-                                                        user_rm_mem->user_object,
-                                                        &ext_gpu_map->mem_handle->rm_handle,
-                                                        &mem_info));
+#if defined(NV_SUNOS)
+    status = uvm_rm_locked_call(nvUvmInterfaceDupMemoryTracked(
+        uvm_gpu_device_handle(mapping_gpu), user_rm_mem->user_client,
+        user_rm_mem->user_object, &ext_gpu_map->mem_handle->rm_handle,
+        &mem_info, &import_token));
+#else
+    status = uvm_rm_locked_call(nvUvmInterfaceDupMemory(
+        uvm_gpu_device_handle(mapping_gpu), user_rm_mem->user_client,
+        user_rm_mem->user_object, &ext_gpu_map->mem_handle->rm_handle,
+        &mem_info));
+#endif
     if (status != NV_OK) {
         UVM_DBG_PRINT("Failed to dup memory handle {0x%x, 0x%x}: %s, GPU: %s\n",
                       user_rm_mem->user_client,
@@ -927,6 +1045,27 @@ static NV_STATUS uvm_map_external_allocation_on_gpu(uvm_va_range_external_t *ext
                       nvstatusToString(status),
                       uvm_gpu_name(mapping_gpu));
         goto error;
+    }
+
+    if (import_token != NULL) {
+        import_owner->token = import_token;
+        ext_gpu_map->mem_handle->import_token = import_token;
+        ext_gpu_map->mem_handle->import_owner = import_owner;
+        uvm_gpu_retain(mapping_gpu);
+        atomic_inc(&va_space->import_owner_count);
+        atomic_inc(&g_uvm_import_owner_count);
+        uvm_spin_lock(&va_space->import_owner_lock);
+        list_add_tail(&import_owner->va_node, &va_space->import_owners);
+        uvm_spin_unlock(&va_space->import_owner_lock);
+
+        status = uvm_rm_locked_call(nvUvmInterfacePublishImport(
+            import_token, import_owner, uvm_ext_gpu_import_owner_revoke));
+        if (status != NV_OK)
+            goto error;
+    }
+    else {
+        uvm_kvfree(import_owner);
+        import_owner = NULL;
     }
 
     status = set_ext_gpu_map_location(ext_gpu_map, va_space, mapping_gpu, &mem_info);
@@ -970,11 +1109,20 @@ static NV_STATUS uvm_map_external_allocation_on_gpu(uvm_va_range_external_t *ext
     if (status != NV_OK)
         goto error;
 
+    if (import_owner != NULL)
+        uvm_import_owner_set_state(import_owner, UVM_IMPORT_ACTIVE);
     uvm_mutex_unlock(&range_tree->lock);
     return NV_OK;
 
 error:
-    uvm_ext_gpu_map_destroy(external_range, ext_gpu_map, NULL);
+    if (import_owner != NULL && import_owner->token == NULL)
+        uvm_kvfree(import_owner);
+    {
+        NV_STATUS cleanup_status = uvm_ext_gpu_map_destroy(external_range,
+                                                             ext_gpu_map, NULL);
+        if (cleanup_status != NV_OK)
+            status = cleanup_status;
+    }
     uvm_mutex_unlock(&range_tree->lock);
     return status;
 }
@@ -1007,6 +1155,13 @@ static NV_STATUS uvm_map_external_allocation(uvm_va_space_t *va_space, UVM_MAP_E
         return NV_ERR_NO_MEMORY;
 
     uvm_va_space_down_read_rm(va_space);
+    if (uvm_import_tracking_enabled() &&
+        (atomic_read(&va_space->user_channels_revoking) ||
+         atomic_read(&va_space->tracked_imports_blocked))) {
+        uvm_va_space_up_read_rm(va_space);
+        uvm_processor_mask_cache_free(mapped_gpus);
+        return NV_ERR_INVALID_STATE;
+    }
     external_range = uvm_va_range_external_find(va_space, params->base);
 
     if (!external_range ||
@@ -1081,8 +1236,14 @@ error:
                                          external_range,
                                          mapping_gpu,
                                          params->base,
-                                         params->base + params->length - 1)
-            uvm_ext_gpu_map_destroy(external_range, ext_map, NULL);
+                                         params->base + params->length - 1) {
+            NV_STATUS cleanup_status = uvm_ext_gpu_map_destroy(external_range,
+                                                                 ext_map, NULL);
+            if (cleanup_status != NV_OK) {
+                status = cleanup_status;
+                break;
+            }
+        }
         uvm_mutex_unlock(&range_tree->lock);
     }
 
@@ -1246,6 +1407,134 @@ static uvm_gpu_t *uvm_ext_gpu_map_free_internal(uvm_ext_gpu_map_t *ext_gpu_map)
     return owning_gpu;
 }
 
+#include "uvm_map_external_revoke_impl.h"
+#include "uvm_map_external_destroy_checked_impl.h"
+#include "uvm_map_external_import_checked_impl.h"
+#include "uvm_map_external_has_tracked_impl.h"
+
+static void uvm_ext_gpu_import_owner_finalize(void *opaque)
+{
+    struct uvm_ext_gpu_import_owner *owner = opaque;
+    NV_STATUS status;
+
+    if (atomic_read(&owner->state) == UVM_IMPORT_COMPLETE) {
+        uvm_import_owner_put(owner);
+        return;
+    }
+
+    UVM_ASSERT(atomic_read(&owner->state) == UVM_IMPORT_NORMAL_FINALIZING);
+    do {
+        status = uvm_rm_locked_call(nvUvmInterfaceImportHardwareComplete(
+            owner->token));
+        if (status == NV_ERR_BUSY_RETRY)
+            schedule();
+    } while (status == NV_ERR_BUSY_RETRY);
+    if (status != NV_OK)
+        goto failed;
+
+    status = uvm_rm_locked_call(nvUvmInterfaceReleaseImportGuard(
+        uvm_gpu_device_handle(owner->gpu), owner->token));
+    if (status != NV_OK && status != NV_WARN_MORE_PROCESSING_REQUIRED)
+        goto failed;
+
+    uvm_import_owner_finish(owner, false);
+    return;
+
+failed:
+    uvm_import_owner_mark_failed(owner, status);
+}
+
+static NV_STATUS uvm_ext_gpu_import_owner_revoke(void *opaque)
+{
+    struct uvm_ext_gpu_import_owner *owner = opaque;
+    NV_STATUS status;
+    int state;
+
+    for (;;) {
+        state = atomic_read(&owner->state);
+        if (state == UVM_IMPORT_BUILDING ||
+            state == UVM_IMPORT_NORMAL_FRAGMENT) {
+            wait_event(owner->state_waitq,
+                       atomic_read(&owner->state) != state);
+            continue;
+        }
+        if (state == UVM_IMPORT_COMPLETE)
+            return NV_OK;
+        if (state == UVM_IMPORT_FAILED)
+            return owner->failure;
+        if (state == UVM_IMPORT_NORMAL_FINALIZING ||
+            state == UVM_IMPORT_REVOKING)
+            return NV_ERR_BUSY_RETRY;
+        UVM_ASSERT(state == UVM_IMPORT_ACTIVE);
+        if (atomic_cmpxchg(&owner->state, UVM_IMPORT_ACTIVE,
+                           UVM_IMPORT_REVOKING) == UVM_IMPORT_ACTIVE)
+            break;
+    }
+
+    status = uvm_ext_gpu_import_revoke_checked(owner->va_space,
+                                                owner->mem_handle);
+    if (status != NV_OK)
+        goto failed;
+    owner->mem_handle = NULL;
+
+    /* The checked map path retired the last duplicate and its GPU PTEs. */
+    do {
+        status = uvm_rm_locked_call(nvUvmInterfaceImportHardwareComplete(
+            owner->token));
+        if (status == NV_ERR_BUSY_RETRY)
+            schedule();
+    } while (status == NV_ERR_BUSY_RETRY);
+    if (status != NV_OK)
+        goto failed;
+
+    status = uvm_rm_locked_call(nvUvmInterfaceReleaseImportGuard(
+        uvm_gpu_device_handle(owner->gpu), owner->token));
+    if (status != NV_OK && status != NV_WARN_MORE_PROCESSING_REQUIRED)
+        goto failed;
+
+    uvm_import_owner_finish(owner, true);
+    return NV_OK;
+
+failed:
+    uvm_import_owner_mark_failed(owner, status);
+    return status;
+}
+
+/*
+ * File release may not have an as_free callback to trigger import revocation.
+ * Borrow each owner independently of the range tree, then run the same checked
+ * callback path without holding a VA or registry lock. A concurrent normal
+ * unmap or pin callback will finish the owner and schedule release resumption.
+ */
+NV_STATUS uvm_va_space_revoke_tracked_imports_checked(uvm_va_space_t *va_space)
+{
+    struct uvm_ext_gpu_import_owner *owner;
+    NV_STATUS status;
+
+    for (;;) {
+        uvm_spin_lock(&va_space->import_owner_lock);
+        if (list_empty(&va_space->import_owners)) {
+            uvm_spin_unlock(&va_space->import_owner_lock);
+            return NV_OK;
+        }
+        owner = list_first_entry(&va_space->import_owners,
+                                 struct uvm_ext_gpu_import_owner, va_node);
+        atomic_inc(&owner->refs);
+        uvm_spin_unlock(&va_space->import_owner_lock);
+
+        if (atomic_read(&owner->state) == UVM_IMPORT_ACTIVE)
+            status = uvm_ext_gpu_import_owner_revoke(owner);
+        else if (atomic_read(&owner->state) == UVM_IMPORT_FAILED)
+            status = owner->failure;
+        else
+            status = NV_ERR_BUSY_RETRY;
+
+        uvm_import_owner_put(owner);
+        if (status != NV_OK)
+            return status;
+    }
+}
+
 void uvm_ext_gpu_map_free(uvm_ext_gpu_map_t *ext_gpu_map)
 {
     uvm_gpu_t *owning_gpu = uvm_ext_gpu_map_free_internal(ext_gpu_map);
@@ -1253,9 +1542,9 @@ void uvm_ext_gpu_map_free(uvm_ext_gpu_map_t *ext_gpu_map)
         uvm_gpu_release(owning_gpu);
 }
 
-void uvm_ext_gpu_map_destroy(uvm_va_range_external_t *external_range,
-                             uvm_ext_gpu_map_t *ext_gpu_map,
-                             struct list_head *deferred_free_list)
+static void uvm_ext_gpu_map_destroy_legacy(uvm_va_range_external_t *external_range,
+                                            uvm_ext_gpu_map_t *ext_gpu_map,
+                                            struct list_head *deferred_free_list)
 {
     uvm_membar_t membar;
     uvm_ext_gpu_range_tree_t *range_tree;
@@ -1328,6 +1617,56 @@ void uvm_ext_gpu_map_destroy(uvm_va_range_external_t *external_range,
         uvm_processor_mask_clear_atomic(&external_range->mapped_gpus, mapped_gpu->id);
 }
 
+static NV_STATUS
+uvm_ext_gpu_map_destroy_tracked(uvm_va_range_external_t *external_range,
+                                 uvm_ext_gpu_map_t *ext_gpu_map)
+{
+    struct uvm_ext_gpu_import_owner *owner =
+        ext_gpu_map->mem_handle->import_owner;
+    bool last = nv_kref_read(&ext_gpu_map->mem_handle->ref_count) == 1;
+    uvm_import_state_t claimed = last ? UVM_IMPORT_NORMAL_FINALIZING :
+                                       UVM_IMPORT_NORMAL_FRAGMENT;
+    NV_STATUS status;
+    int state;
+
+    if (owner == NULL)
+        return NV_ERR_INVALID_STATE;
+
+    for (;;) {
+        state = atomic_read(&owner->state);
+        if (state == UVM_IMPORT_FAILED)
+            return owner->failure;
+        if (state != UVM_IMPORT_ACTIVE && state != UVM_IMPORT_BUILDING)
+            return NV_ERR_BUSY_RETRY;
+        if (atomic_cmpxchg(&owner->state, state, claimed) == state)
+            break;
+    }
+
+    status = uvm_ext_gpu_map_destroy_checked(external_range, ext_gpu_map);
+    if (status != NV_OK) {
+        uvm_import_owner_mark_failed(owner, status);
+        return status;
+    }
+
+    if (!last) {
+        uvm_import_owner_set_state(owner, UVM_IMPORT_ACTIVE);
+        return NV_OK;
+    }
+
+    owner->mem_handle = NULL;
+    wake_up_all(&owner->state_waitq);
+    nv_kthread_q_item_init(&owner->finalize_item,
+                           uvm_ext_gpu_import_owner_finalize, owner);
+    if (!nv_kthread_q_schedule_q_item(&g_uvm_global.deferred_release_q,
+                                       &owner->finalize_item)) {
+        uvm_import_owner_mark_failed(owner, NV_ERR_OPERATING_SYSTEM);
+        return NV_ERR_OPERATING_SYSTEM;
+    }
+    return NV_OK;
+}
+
+#include "uvm_map_external_destroy_dispatch_impl.h"
+
 static NV_STATUS uvm_unmap_external(uvm_va_space_t *va_space,
                                     NvU64 base,
                                     NvU64 length,
@@ -1342,7 +1681,7 @@ static NV_STATUS uvm_unmap_external(uvm_va_space_t *va_space,
     if (uvm_api_range_invalid_4k(base, length))
         return NV_ERR_INVALID_ADDRESS;
 
-    uvm_va_space_down_read(va_space);
+    uvm_va_space_down_read_rm(va_space);
 
     external_range = uvm_va_range_external_find(va_space, base);
     if (!external_range || base + length - 1 > external_range->va_range.node.end) {
@@ -1368,7 +1707,7 @@ static NV_STATUS uvm_unmap_external(uvm_va_space_t *va_space,
         uvm_gpu_retain(gpu);
 
 out:
-    uvm_va_space_up_read(va_space);
+    uvm_va_space_up_read_rm(va_space);
 
     if (!list_empty(&deferred_free_list)) {
         uvm_deferred_free_object_list(&deferred_free_list);
