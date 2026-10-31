@@ -39,6 +39,9 @@
 #include "mem_mgr/gpu_vaspace.h"
 #include "platform/sli/sli.h"
 #include "kernel/rmapi/mapping_list.h"
+#if defined(NV_SUNOS)
+NvBool os_umem_map_allowed(void *, NvU32);
+#endif
 
 #include "class/cl0070.h" // NV01_MEMORY_VIRTUAL
 #include "class/cl50a0.h" // NV50_MEMORY_VIRTUAL
@@ -1218,6 +1221,12 @@ virtmemMapTo_IMPL
     NvBool      bKernelMappingRequired = FLD_TEST_DRF(OS46, _FLAGS, _KERNEL_MAPPING, _ENABLE, flags);
     NvBool      bSetPteKind = NV_FALSE;
     NvU32       pteKind;
+
+#if defined(NV_SUNOS)
+    /* A raw RM DMA map has no UVM owner to revoke it at process exit. */
+    if (!os_umem_map_allowed(pSrcMemDesc, hClient))
+        return NV_ERR_NOT_SUPPORTED;
+#endif
 
     //
     // Allow unicast on NV01_MEMORY_VIRTUAL object, but maintain the broadcast

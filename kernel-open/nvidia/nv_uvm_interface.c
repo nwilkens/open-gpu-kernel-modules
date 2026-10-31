@@ -31,6 +31,7 @@
 
 #if defined(__illumos__)
 #include "nv-illumos-kpi.h"
+#include "os-interface.h"
 #else
 #include "os-interface.h"
 #include "nv-linux.h"
@@ -335,6 +336,35 @@ void nvUvmInterfaceAddressSpaceDestroy(uvmGpuAddressSpaceHandle vaSpace)
     nvUvmFreeSafeStack(sp);
 }
 EXPORT_SYMBOL(nvUvmInterfaceAddressSpaceDestroy);
+
+NV_STATUS nvUvmInterfaceRevokeAddressSpace(uvmGpuAddressSpaceHandle vaSpace)
+{
+    nvidia_stack_t *sp = NULL;
+    NV_STATUS status;
+
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+        return NV_ERR_NO_MEMORY;
+
+    status = rm_gpu_ops_revoke_address_space(sp, (gpuAddressSpaceHandle)vaSpace);
+    nv_kmem_cache_free_stack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceRevokeAddressSpace);
+
+NV_STATUS nvUvmInterfaceVerifyVaSpaceChannelsRevoked(uvmGpuAddressSpaceHandle vaSpace)
+{
+    nvidia_stack_t *sp = NULL;
+    NV_STATUS status;
+
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+        return NV_ERR_NO_MEMORY;
+
+    status = rm_gpu_ops_verify_vaspace_channels_revoked(sp,
+        (gpuAddressSpaceHandle)vaSpace);
+    nv_kmem_cache_free_stack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceVerifyVaSpaceChannelsRevoked);
 
 NV_STATUS nvUvmInterfaceMemoryAllocFB(uvmGpuAddressSpaceHandle vaSpace,
                     NvLength length, UvmGpuPointer * gpuPointer,
@@ -781,6 +811,80 @@ NV_STATUS nvUvmInterfaceDupMemory(uvmGpuDeviceHandle device,
 }
 EXPORT_SYMBOL(nvUvmInterfaceDupMemory);
 
+NV_STATUS nvUvmInterfaceDupMemoryTracked(uvmGpuDeviceHandle device,
+                                         NvHandle hClient,
+                                         NvHandle hPhysMemory,
+                                         NvHandle *hDupMemory,
+                                         UvmGpuMemoryInfo *pGpuMemoryInfo,
+                                         void **ppImportToken)
+{
+    nvidia_stack_t *sp = NULL;
+    NV_STATUS status;
+
+    if (ppImportToken == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    *ppImportToken = NULL;
+    if (nv_kmem_cache_alloc_stack(&sp) != 0)
+        return NV_ERR_NO_MEMORY;
+
+    status = rm_gpu_ops_dup_memory_tracked(sp,
+                                          (gpuDeviceHandle)device,
+                                          hClient,
+                                          hPhysMemory,
+                                          hDupMemory,
+                                          pGpuMemoryInfo,
+                                          ppImportToken);
+    nv_kmem_cache_free_stack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceDupMemoryTracked);
+
+NV_STATUS nvUvmInterfacePublishImport(void *token, void *owner,
+                                      NV_STATUS (*revoke)(void *))
+{
+#if defined(NV_SUNOS) || defined(__illumos__)
+    return os_umem_import_publish(token, owner, revoke);
+#else
+    return NV_OK;
+#endif
+}
+EXPORT_SYMBOL(nvUvmInterfacePublishImport);
+
+void nvUvmInterfaceCancelImport(void *token)
+{
+#if defined(NV_SUNOS) || defined(__illumos__)
+    os_umem_import_cancel(token);
+#endif
+}
+EXPORT_SYMBOL(nvUvmInterfaceCancelImport);
+
+NV_STATUS nvUvmInterfaceImportHardwareComplete(void *token)
+{
+#if defined(NV_SUNOS) || defined(__illumos__)
+    return os_umem_import_hardware_complete(token);
+#else
+    return NV_OK;
+#endif
+}
+EXPORT_SYMBOL(nvUvmInterfaceImportHardwareComplete);
+
+NV_STATUS nvUvmInterfaceReleaseImportGuard(uvmGpuDeviceHandle device,
+                                           void *token)
+{
+    nvidia_stack_t *sp;
+    NV_STATUS status;
+
+    if (token == NULL)
+        return NV_OK;
+    sp = nvUvmGetSafeStack();
+    status = rm_gpu_ops_release_import_guard(sp,
+                                             (gpuDeviceHandle)device,
+                                             token);
+    nvUvmFreeSafeStack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceReleaseImportGuard);
+
 
 NV_STATUS nvUvmInterfaceFreeDupedHandle(uvmGpuDeviceHandle device,
                                         NvHandle hPhysHandle)
@@ -796,6 +900,24 @@ NV_STATUS nvUvmInterfaceFreeDupedHandle(uvmGpuDeviceHandle device,
     return status;
 }
 EXPORT_SYMBOL(nvUvmInterfaceFreeDupedHandle);
+
+NV_STATUS nvUvmInterfaceFreeDupedHandleChecked(uvmGpuDeviceHandle device,
+                                               NvHandle hPhysHandle,
+                                               NvBool *pIovaReleased)
+{
+    nvidia_stack_t *sp = nvUvmGetSafeStack();
+    NV_STATUS status;
+
+    if (pIovaReleased == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    status = rm_gpu_ops_free_duped_handle_checked(sp,
+                                                  (gpuDeviceHandle)device,
+                                                  hPhysHandle,
+                                                  pIovaReleased);
+    nvUvmFreeSafeStack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceFreeDupedHandleChecked);
 
 NV_STATUS nvUvmInterfaceGetFbInfo(uvmGpuDeviceHandle device,
                                   UvmGpuFbInfo * fbInfo)
@@ -1441,15 +1563,29 @@ void nvUvmInterfaceReleaseChannel(void *retainedChannel)
 }
 EXPORT_SYMBOL(nvUvmInterfaceReleaseChannel);
 
-void nvUvmInterfaceStopChannel(void *retainedChannel, NvBool bImmediate)
+NV_STATUS nvUvmInterfaceStopChannel(void *retainedChannel, NvBool bImmediate)
 {
     nvidia_stack_t *sp = nvUvmGetSafeStack();
+    NV_STATUS status;
 
-    rm_gpu_ops_stop_channel(sp, retainedChannel, bImmediate);
+    status = rm_gpu_ops_stop_channel(sp, retainedChannel, bImmediate);
 
     nvUvmFreeSafeStack(sp);
+    return status;
 }
 EXPORT_SYMBOL(nvUvmInterfaceStopChannel);
+
+NV_STATUS nvUvmInterfaceRevokeChannel(void *retainedChannel)
+{
+    nvidia_stack_t *sp = nvUvmGetSafeStack();
+    NV_STATUS status;
+
+    status = rm_gpu_ops_revoke_channel(sp, retainedChannel);
+
+    nvUvmFreeSafeStack(sp);
+    return status;
+}
+EXPORT_SYMBOL(nvUvmInterfaceRevokeChannel);
 
 NV_STATUS nvUvmInterfaceGetChannelResourcePtes(uvmGpuAddressSpaceHandle vaSpace,
                                                NvP64 resourceDescriptor,

@@ -556,6 +556,10 @@ static NV_STATUS uvm_register_channel_under_write(struct mm_struct *mm,
     // Just disallow it for now.
     if (atomic_read(&va_space->user_channels_stopped))
         return NV_ERR_INVALID_STATE;
+#if defined(NV_SUNOS)
+    if (atomic_read(&va_space->user_channels_revoking))
+        return NV_ERR_INVALID_STATE;
+#endif
 
     // If the VA space's mm has been torn down we can't allow more work. mm
     // teardown (when available) stops all channels, so the check above should
@@ -763,19 +767,24 @@ void uvm_user_channel_release(uvm_user_channel_t *user_channel)
         nv_kref_put(&user_channel->kref, free_user_channel);
 }
 
-void uvm_user_channel_stop(uvm_user_channel_t *user_channel)
+#include "uvm_user_channel_stop_state_impl.h"
+
+static NV_STATUS uvm_user_channel_stop_internal(uvm_user_channel_t *user_channel,
+                                                 NvBool bImmediate,
+                                                 bool checked)
 {
     uvm_va_space_t *va_space = user_channel->gpu_va_space->va_space;
+    NV_STATUS status;
 
     if (!user_channel->rm_retained_channel)
-        return;
+        return NV_OK;
 
     // Skip if this channel was never bound, or if it's already been stopped.
     // Note that since we only hold the VA space lock in read mode here, two
     // threads could race and both call nvUvmInterfaceStopChannel concurrently.
     // RM handles that with internal locking, so it's not a problem.
     if (!atomic_read(&user_channel->is_bound))
-        return;
+        return NV_OK;
 
     // TODO: Bug 1799173: Normal lock tracking should handle this assert once
     //       all RM calls have been moved out from under the VA space lock in
@@ -785,12 +794,56 @@ void uvm_user_channel_stop(uvm_user_channel_t *user_channel)
     // TODO: Bug 1737765. This doesn't stop the user from putting the
     //       channel back on the runlist, which could put stale instance
     //       pointers back in the fault buffer.
-    uvm_rm_locked_call_void(nvUvmInterfaceStopChannel(user_channel->rm_retained_channel,
-                                                      va_space->user_channel_stops_are_immediate));
-
+    status = uvm_rm_locked_call(nvUvmInterfaceStopChannel(user_channel->rm_retained_channel,
+                                                          bImmediate));
     // Multiple threads could perform this set concurrently, but is_bound never
     // transitions back to 1 after being set to 0 so that's not a problem.
-    atomic_set(&user_channel->is_bound, 0);
+    if (uvm_user_channel_stop_clears_bound(status, checked))
+        atomic_set(&user_channel->is_bound, 0);
+    return status;
+}
+
+NV_STATUS uvm_user_channel_stop_checked(uvm_user_channel_t *user_channel)
+{
+    return uvm_user_channel_stop_internal(user_channel, NV_FALSE, true);
+}
+
+NV_STATUS uvm_user_channel_stop_mode_checked(uvm_user_channel_t *user_channel, bool immediate)
+{
+    return uvm_user_channel_stop_internal(user_channel, immediate, true);
+}
+
+NV_STATUS uvm_user_channel_revoke_checked(uvm_user_channel_t *user_channel)
+{
+    uvm_va_space_t *va_space = user_channel->gpu_va_space->va_space;
+    NV_STATUS status;
+
+    if (!user_channel->rm_retained_channel)
+        return NV_OK;
+
+    uvm_assert_rwsem_locked_read(&va_space->lock);
+
+    /* Revoke even if an ordinary stop already cleared is_bound. */
+    status = uvm_rm_locked_call(nvUvmInterfaceRevokeChannel(user_channel->rm_retained_channel));
+    if (status == NV_OK)
+        atomic_set(&user_channel->is_bound, 0);
+    return status;
+}
+
+void uvm_user_channel_stop(uvm_user_channel_t *user_channel)
+{
+    NV_STATUS status = uvm_user_channel_stop_internal(
+        user_channel,
+        user_channel->gpu_va_space->va_space->user_channel_stops_are_immediate,
+        false);
+
+#if defined(NV_SUNOS)
+    if (status != NV_OK)
+        UVM_ERR_PRINT("Stopping user channel failed: %s\n",
+                      nvstatusToString(status));
+#else
+    (void)status;
+#endif
 }
 
 void uvm_user_channel_detach(uvm_user_channel_t *user_channel, struct list_head *deferred_free_list)
@@ -826,6 +879,11 @@ void uvm_user_channel_detach(uvm_user_channel_t *user_channel, struct list_head 
     }
 
     list_del(&user_channel->list_node);
+
+#if defined(NV_SUNOS)
+    user_channel->detach_va_space = va_space;
+    atomic_inc(&va_space->detached_channel_count);
+#endif
 
     uvm_deferred_free_object_add(deferred_free_list,
                                  &user_channel->deferred_free,
@@ -866,8 +924,13 @@ static void check_dead(uvm_user_channel_t *user_channel)
     user_channel->test.dead.page = NULL;
 }
 
-void uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel)
+NV_STATUS uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel)
 {
+#if defined(NV_SUNOS)
+    uvm_va_space_t *detach_va_space = user_channel->detach_va_space;
+#endif
+    NV_STATUS status = NV_OK;
+
     // Check that this channel was already detached
     UVM_ASSERT(user_channel->gpu_va_space == NULL);
 
@@ -878,7 +941,25 @@ void uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel)
     // methods to a per-user_channel clear_faulted_tracker. We need to wait for
     // this tracker before calling nvUvmInterfaceReleaseChannel, since that
     // will release the channel id back to RM.
-    uvm_tracker_wait_deinit(&user_channel->clear_faulted_tracker);
+#if defined(NV_SUNOS)
+    status = uvm_tracker_wait_deinit(&user_channel->clear_faulted_tracker);
+    if (status == NV_OK)
+        status = user_channel->deferred_flush_status;
+    if (status != NV_OK) {
+        if (detach_va_space != NULL)
+            atomic_cmpxchg(&detach_va_space->detached_channel_error, NV_OK, status);
+        /* Channel creation borrows the VA's GPU reference. Quarantine needs
+         * its own reference if GPU unregister or VA close follows. */
+        uvm_gpu_retain(user_channel->gpu);
+        UVM_ERR_PRINT("Detached channel fault drain failed: %s\n",
+                      nvstatusToString(status));
+        /* Keep the RM channel ID and GPU reference from being reused while
+         * its clear-faulted work has an uncertain completion state. */
+        goto out;
+    }
+#else
+    (void)uvm_tracker_wait_deinit(&user_channel->clear_faulted_tracker);
+#endif
 
     if (user_channel->resources) {
         UVM_ASSERT(!user_channel->channel_ranges);
@@ -890,6 +971,16 @@ void uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel)
         uvm_rm_locked_call_void(nvUvmInterfaceReleaseChannel(user_channel->rm_retained_channel));
 
     uvm_user_channel_release(user_channel);
+#if defined(NV_SUNOS)
+out:
+    if (detach_va_space != NULL) {
+        uvm_mutex_lock(&detach_va_space->detached_channel_completion_lock);
+        atomic_dec(&detach_va_space->detached_channel_count);
+        wake_up(&detach_va_space->detached_channel_waitq);
+        uvm_mutex_unlock(&detach_va_space->detached_channel_completion_lock);
+    }
+#endif
+    return status;
 }
 
 static NV_STATUS uvm_unregister_channel(uvm_va_space_t *va_space, uvm_rm_user_object_t *user_rm_channel)
@@ -910,13 +1001,29 @@ static NV_STATUS uvm_unregister_channel(uvm_va_space_t *va_space, uvm_rm_user_ob
     user_channel = find_user_channel(va_space, user_rm_channel);
     if (user_channel) {
         uvm_user_channel_retain(user_channel);
+#if defined(NV_SUNOS)
+        status = uvm_user_channel_stop_mode_checked(
+            user_channel, va_space->user_channel_stops_are_immediate);
+#else
         uvm_user_channel_stop(user_channel);
+#endif
     }
 
     uvm_va_space_up_read_rm(va_space);
 
     if (!user_channel)
         return NV_ERR_INVALID_CHANNEL;
+
+#if defined(NV_SUNOS)
+    if (status != NV_OK) {
+        /* RM may still be running this channel. Keep its VA ranges and
+         * instance-pointer registration intact for a later retry/close. */
+        UVM_ERR_PRINT_ALWAYS("Retaining channel after failed stop: %s\n",
+                             nvstatusToString(status));
+        uvm_user_channel_release(user_channel);
+        return status;
+    }
+#endif
 
     // Re-take the lock in write mode to detach the channel
     uvm_va_space_down_write(va_space);
@@ -935,7 +1042,7 @@ static NV_STATUS uvm_unregister_channel(uvm_va_space_t *va_space, uvm_rm_user_ob
     uvm_va_space_up_write(va_space);
 
     if (status == NV_OK) {
-        uvm_deferred_free_object_list(&deferred_free_list);
+        status = uvm_deferred_free_object_list(&deferred_free_list);
         uvm_gpu_release(gpu);
     }
 

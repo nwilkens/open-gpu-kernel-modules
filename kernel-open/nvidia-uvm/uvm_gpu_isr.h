@@ -205,5 +205,7 @@ uvm_gpu_t *uvm_parent_gpu_find_first_valid_gpu(uvm_parent_gpu_t *parent_gpu);
 //
 // parent_gpu->isr.interrupts_lock must be held to call this function.
 unsigned uvm_parent_gpu_schedule_non_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu);
+NV_STATUS uvm_parent_gpu_schedule_non_replayable_faults_handler_checked(uvm_parent_gpu_t *parent_gpu,
+                                                                        unsigned *scheduled_out);
 
 #endif // __UVM_GPU_ISR_H__

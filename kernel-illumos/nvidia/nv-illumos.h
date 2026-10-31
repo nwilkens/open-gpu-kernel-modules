@@ -447,6 +447,9 @@ NvBool nv_may_sleep(void);
 extern struct devmap_callback_ctl nv_devmap_callbacks;
 void nv_dma_init(void);
 void nv_dma_fini(void);
+int nv_umem_init(void);
+void nv_umem_fini(void);
+boolean_t nv_umem_busy(void);
 NvBool nv_dma_detect_remap(dev_info_t *);
 int  nv_devmap_sysmem(nv_illumos_file_private_t *, devmap_cookie_t,
          nv_alloc_mapping_context_t *, offset_t, size_t, size_t *);

@@ -1,5 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Edgecast Cloud LLC.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -37,6 +38,7 @@
 #include "nv-illumos.h"
 #include "nv-reg.h"
 #include "nvidia_mem.h"
+#include "nvidia_mem_cache_policy.h"
 
 #include <sys/vmem.h>
 #include <sys/vmsystm.h>
@@ -432,7 +434,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
     if (at == NULL)
         return NV_ERR_NO_MEMORY;
 
-    at->cache_type = cache_type;
+    at->cache_type = nv_sysmem_effective_cache_type(cache_type);
     at->flags.contig = contiguous;
     at->flags.zeroed = zeroed;
     if (node_id >= 0)

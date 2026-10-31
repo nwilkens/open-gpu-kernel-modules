@@ -40,6 +40,8 @@ NV_STATUS  NV_API_CALL  rm_gpu_ops_device_destroy (nvidia_stack_t *, nvgpuDevice
 NV_STATUS  NV_API_CALL  rm_gpu_ops_address_space_create(nvidia_stack_t *, nvgpuDeviceHandle_t, unsigned long long, unsigned long long, NvBool, nvgpuAddressSpaceHandle_t *, nvgpuAddressSpaceInfo_t);
 NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_address_space(nvidia_stack_t *, nvgpuDeviceHandle_t, NvHandle, NvHandle, nvgpuAddressSpaceHandle_t *, nvgpuAddressSpaceInfo_t);
 NV_STATUS  NV_API_CALL  rm_gpu_ops_address_space_destroy(nvidia_stack_t *, nvgpuAddressSpaceHandle_t);
+NV_STATUS  NV_API_CALL  rm_gpu_ops_revoke_address_space(nvidia_stack_t *, nvgpuAddressSpaceHandle_t);
+NV_STATUS  NV_API_CALL  rm_gpu_ops_verify_vaspace_channels_revoked(nvidia_stack_t *, nvgpuAddressSpaceHandle_t);
 NV_STATUS  NV_API_CALL  rm_gpu_ops_memory_alloc_fb(nvidia_stack_t *, nvgpuAddressSpaceHandle_t, NvLength, NvU64 *, nvgpuAllocInfo_t);
 
 NV_STATUS  NV_API_CALL  rm_gpu_ops_pma_alloc_pages(nvidia_stack_t *, void *, NvLength, NvU32 , nvgpuPmaAllocationOptions_t, NvU64 *);
@@ -67,8 +69,11 @@ NV_STATUS  NV_API_CALL rm_gpu_ops_service_device_interrupts_rm(nvidia_stack_t *,
 NV_STATUS  NV_API_CALL rm_gpu_ops_dup_allocation(nvidia_stack_t *, nvgpuAddressSpaceHandle_t, NvU64, nvgpuAddressSpaceHandle_t, NvU64, NvU64 *);
 
 NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_memory (nvidia_stack_t *, nvgpuDeviceHandle_t, NvHandle, NvHandle, NvHandle *, nvgpuMemoryInfo_t);
+NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_memory_tracked(nvidia_stack_t *, nvgpuDeviceHandle_t, NvHandle, NvHandle, NvHandle *, nvgpuMemoryInfo_t, void **);
 
 NV_STATUS  NV_API_CALL rm_gpu_ops_free_duped_handle(nvidia_stack_t *, nvgpuDeviceHandle_t, NvHandle);
+NV_STATUS  NV_API_CALL rm_gpu_ops_free_duped_handle_checked(nvidia_stack_t *, nvgpuDeviceHandle_t, NvHandle, NvBool *);
+NV_STATUS  NV_API_CALL rm_gpu_ops_release_import_guard(nvidia_stack_t *, nvgpuDeviceHandle_t, void *);
 NV_STATUS  NV_API_CALL rm_gpu_ops_get_fb_info(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuFbInfo_t);
 NV_STATUS  NV_API_CALL rm_gpu_ops_get_ecc_info(nvidia_stack_t *, nvgpuDeviceHandle_t, nvgpuEccInfo_t);
 NV_STATUS NV_API_CALL rm_gpu_ops_own_page_fault_intr(nvidia_stack_t *, nvgpuDeviceHandle_t, NvBool);
@@ -96,7 +101,8 @@ NV_STATUS  NV_API_CALL rm_gpu_ops_get_external_alloc_phys_addrs(nvidia_stack_t*,
 NV_STATUS  NV_API_CALL rm_gpu_ops_retain_channel(nvidia_stack_t *, nvgpuAddressSpaceHandle_t, NvHandle, NvHandle, void **, nvgpuChannelInstanceInfo_t);
 NV_STATUS  NV_API_CALL rm_gpu_ops_bind_channel_resources(nvidia_stack_t *, void *, nvgpuChannelResourceBindParams_t);
 void       NV_API_CALL rm_gpu_ops_release_channel(nvidia_stack_t *, void *);
-void       NV_API_CALL rm_gpu_ops_stop_channel(nvidia_stack_t *, void *, NvBool);
+NV_STATUS  NV_API_CALL rm_gpu_ops_stop_channel(nvidia_stack_t *, void *, NvBool);
+NV_STATUS  NV_API_CALL rm_gpu_ops_revoke_channel(nvidia_stack_t *, void *);
 NV_STATUS  NV_API_CALL rm_gpu_ops_get_channel_resource_ptes(nvidia_stack_t *, nvgpuAddressSpaceHandle_t, NvP64, NvU64, NvU64, nvgpuExternalMappingInfo_t);
 NV_STATUS  NV_API_CALL rm_gpu_ops_report_non_replayable_fault(nvidia_stack_t *, nvgpuDeviceHandle_t, const void *);
 

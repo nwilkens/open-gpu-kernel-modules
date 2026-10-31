@@ -33,11 +33,13 @@
 #include "uvm_thread_context.h"
 #include "uvm_hal.h"
 #include "uvm_map_external.h"
+#include "uvm_import_platform_impl.h"
 #include "uvm_va_range_dmabuf.h"
 #include "uvm_ats.h"
 #include "uvm_gpu_replayable_faults.h"
 #include "uvm_gpu_non_replayable_faults.h"
 #include "uvm_gpu_access_counters.h"
+#include "uvm_gpu_isr.h"
 #include "uvm_hmm.h"
 #include "uvm_va_space_mm.h"
 #include "uvm_test.h"
@@ -88,6 +90,30 @@ static void remove_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space,
                                 struct mm_struct *mm,
                                 struct list_head *deferred_free_list);
 static void va_space_remove_dummy_thread_contexts(uvm_va_space_t *va_space);
+
+static void uvm_va_space_import_release_worker(void *data)
+{
+    uvm_va_space_t *va_space = data;
+
+    uvm_down_read(&g_uvm_global.pm.lock);
+    uvm_va_space_destroy(va_space);
+    uvm_up_read(&g_uvm_global.pm.lock);
+}
+
+void uvm_va_space_resume_import_release(uvm_va_space_t *va_space)
+{
+    int queued;
+
+    /* Called with import_owner_lock held by the last owner finalizer. */
+    if (uvm_va_space_has_tracked_imports(va_space) ||
+        atomic_cmpxchg(&va_space->import_release_pending, 1, 2) != 1)
+        return;
+
+    queued = nv_kthread_q_schedule_q_item(&g_uvm_global.deferred_release_q,
+                                           &va_space->import_resume_release_q_item);
+    if (!queued)
+        UVM_ERR_PRINT("Failed to queue retained VA-space release\n");
+}
 
 static void init_tools_data(uvm_va_space_t *va_space)
 {
@@ -255,9 +281,24 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
         return NV_ERR_INVALID_ARGUMENT;
     }
 
+    atomic_set(&va_space->import_owner_count, 0);
+    atomic_set(&va_space->user_fault_quiesce_failed, 0);
+    atomic_set(&va_space->detached_channel_count, 0);
+    atomic_set(&va_space->detached_channel_error, NV_OK);
+    init_waitqueue_head(&va_space->detached_channel_waitq);
+    atomic_set(&va_space->tracked_imports_blocked, 0);
+    atomic_set(&va_space->import_release_pending, 0);
+    INIT_LIST_HEAD(&va_space->import_owners);
+    INIT_LIST_HEAD(&va_space->import_revoke_channels);
+    uvm_spin_lock_init(&va_space->import_owner_lock, UVM_LOCK_ORDER_LEAF);
+    nv_kthread_q_item_init(&va_space->import_resume_release_q_item,
+                           uvm_va_space_import_release_worker, va_space);
+
     uvm_init_rwsem(&va_space->lock, UVM_LOCK_ORDER_VA_SPACE);
     uvm_mutex_init(&va_space->closest_processors.mask_mutex, UVM_LOCK_ORDER_LEAF);
     uvm_mutex_init(&va_space->serialize_writers_lock, UVM_LOCK_ORDER_VA_SPACE_SERIALIZE_WRITERS);
+    uvm_mutex_init(&va_space->import_revoke_lock, UVM_LOCK_ORDER_VA_SPACE_IMPORT_REVOKE);
+    uvm_mutex_init(&va_space->detached_channel_completion_lock, UVM_LOCK_ORDER_LEAF);
     uvm_mutex_init(&va_space->read_acquire_write_release_lock,
                    UVM_LOCK_ORDER_VA_SPACE_READ_ACQUIRE_WRITE_RELEASE_LOCK);
     uvm_spin_lock_init(&va_space->va_space_mm.lock, UVM_LOCK_ORDER_LEAF);
@@ -483,17 +524,30 @@ static void unregister_gpu(uvm_va_space_t *va_space,
     va_space_check_processors_masks(va_space);
 }
 
-static void gpu_va_space_stop_all_channels(uvm_gpu_va_space_t *gpu_va_space)
+static NV_STATUS gpu_va_space_stop_all_channels(uvm_gpu_va_space_t *gpu_va_space)
 {
     uvm_user_channel_t *user_channel;
+    NV_STATUS status = NV_OK;
 
-    list_for_each_entry(user_channel, &gpu_va_space->registered_channels, list_node)
+    list_for_each_entry(user_channel, &gpu_va_space->registered_channels, list_node) {
+#if defined(NV_SUNOS)
+        NV_STATUS channel_status = uvm_user_channel_stop_mode_checked(
+            user_channel, gpu_va_space->va_space->user_channel_stops_are_immediate);
+
+        if (status == NV_OK)
+            status = channel_status;
+#else
         uvm_user_channel_stop(user_channel);
+#endif
+    }
 
     // Prevent new channels from being registered since we'll be dropping the
     // VA space lock shortly with the expectation that no more channels will
     // arrive.
-    atomic_set(&gpu_va_space->disallow_new_channels, 1);
+    if (status == NV_OK)
+        atomic_set(&gpu_va_space->disallow_new_channels, 1);
+
+    return status;
 }
 
 // Detaches (unregisters) all user channels in a GPU VA space. The channels must
@@ -517,13 +571,58 @@ void uvm_va_space_detach_all_user_channels(uvm_va_space_t *va_space, struct list
         uvm_gpu_va_space_detach_all_user_channels(gpu_va_space, deferred_free_list);
 }
 
+#if defined(NV_SUNOS)
+static NV_STATUS uvm_va_space_stop_all_user_channels_status(uvm_va_space_t *va_space, bool immediate);
+#endif
+
 void uvm_va_space_destroy(uvm_va_space_t *va_space)
 {
     uvm_va_range_t *va_range, *va_range_next;
     uvm_gpu_t *gpu;
     uvm_gpu_id_t gpu_id;
+#if defined(NV_SUNOS)
+    NV_STATUS import_status;
+    NV_STATUS channel_status;
+#endif
     uvm_processor_mask_t *retained_gpus = &va_space->registered_gpus_teardown;
     LIST_HEAD(deferred_free_list);
+
+#if defined(NV_SUNOS)
+    /* Normal file close may have no CPU unmap callback to start revocation. */
+    if (uvm_va_space_has_tracked_imports(va_space)) {
+        import_status = uvm_va_space_revoke_tracked_imports_checked(va_space);
+        if (import_status != NV_OK && import_status != NV_ERR_BUSY_RETRY)
+            UVM_ERR_PRINT("Tracked import release failed: %s\n",
+                          nvstatusToString(import_status));
+    }
+
+    /*
+     * A tracked OS-descriptor import may already be off the range tree and
+     * waiting for deferred RM free. Releasing the VA space here would leave
+     * its pin callback with a dangling GPU/VA owner. Keep the whole VA space
+     * intact until every checked import teardown has completed.
+     */
+    uvm_spin_lock(&va_space->import_owner_lock);
+    if (uvm_va_space_has_tracked_imports(va_space)) {
+        (void) atomic_cmpxchg(&va_space->import_release_pending, 0, 1);
+        uvm_spin_unlock(&va_space->import_owner_lock);
+        UVM_ERR_PRINT("Retaining VA space with live tracked imports\n");
+        return;
+    }
+    uvm_spin_unlock(&va_space->import_owner_lock);
+
+    /* A failed ordinary RM stop leaves is_bound set. Do not detach or free
+     * anything the GPU may still access; final file release is deferred. */
+    uvm_va_space_down_read_rm(va_space);
+    channel_status = uvm_va_space_stop_all_user_channels_status(
+        va_space, va_space->user_channel_stops_are_immediate);
+    uvm_va_space_up_read_rm(va_space);
+    if (channel_status != NV_OK) {
+        UVM_ERR_PRINT_ALWAYS("Retaining VA space after failed channel stop: %s\n",
+                             nvstatusToString(channel_status));
+        return;
+    }
+#endif
 
     // Remove the VA space from the global list before we start tearing things
     // down so other threads can't see the VA space in a partially-valid state.
@@ -540,9 +639,11 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
     //
     // This involves making RM calls, so we have to do that with the VA space
     // lock in read mode.
+#if !defined(NV_SUNOS)
     uvm_va_space_down_read_rm(va_space);
     uvm_va_space_stop_all_user_channels(va_space);
     uvm_va_space_up_read_rm(va_space);
+#endif
 
     // The bottom half GPU page fault handler(s) could still look up and use
     // this va_space via the GPU's instance_ptr_table. Lock them out while we
@@ -639,6 +740,26 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
 
     uvm_deferred_free_object_list(&deferred_free_list);
 
+#if defined(NV_SUNOS)
+    /* An unregister thread may have detached a channel into its own local
+     * list before file close. Its completion callback still uses this VA
+     * space to publish the checked tracker result. */
+    wait_event(va_space->detached_channel_waitq,
+               atomic_read(&va_space->detached_channel_count) == 0);
+    /* A completed channel decrements the count before waking this queue.
+     * Join its critical section before freeing the queue storage. */
+    uvm_mutex_lock(&va_space->detached_channel_completion_lock);
+    uvm_mutex_unlock(&va_space->detached_channel_completion_lock);
+    if (atomic_read(&va_space->detached_channel_error) != NV_OK ||
+        atomic_read(&va_space->user_fault_quiesce_failed) ||
+        !list_empty(&va_space->import_revoke_channels)) {
+        /* A failed channel tracker cannot release its RM handle or GPU.
+         * Keep this VA space and its retained GPU references quarantined. */
+        UVM_ERR_PRINT("Retaining VA space after uncertain channel drain\n");
+        return;
+    }
+#endif
+
     // Normally we'd expect this to happen as part of uvm_release_mm()
     // but if userspace never initialized uvm_mm_fd that won't happen.
     // We don't have to take the va_space_mm spinlock and update state
@@ -681,15 +802,129 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
     uvm_mutex_unlock(&g_uvm_global.global_lock);
 
     uvm_kvfree(va_space->mapping);
+#if defined(NV_SUNOS)
+    /* The final VA owner has finished using the file's accounting state. */
+    if (va_space->import_release_file != NULL)
+        uvm_illumos_finish_deferred_file(va_space->import_release_file);
+#endif
     uvm_kvfree(va_space);
+}
+
+#include "uvm_va_space_stop_all_checked_impl.h"
+
+NV_STATUS uvm_va_space_quiesce_user_faults_checked(uvm_va_space_t *va_space)
+{
+    uvm_processor_mask_t retained_gpus;
+    uvm_parent_processor_mask_t flushed_parents;
+    uvm_deferred_free_object_t *object;
+    uvm_user_channel_t *channel;
+    uvm_gpu_t *gpu;
+    NV_STATUS status = NV_OK;
+
+    /* Concurrent import callbacks share a VA space. The writer lock must be
+     * dropped before flushing fault workers, so serialize the whole barrier. */
+    uvm_mutex_lock(&va_space->import_revoke_lock);
+    if (atomic_read(&va_space->user_fault_quiesce_failed)) {
+        status = NV_ERR_INVALID_STATE;
+        goto out;
+    }
+
+    uvm_va_space_down_write(va_space);
+    if (!atomic_read(&va_space->user_channels_revoked)) {
+        status = NV_ERR_INVALID_STATE;
+        uvm_va_space_up_write(va_space);
+        goto failed;
+    }
+
+    /* STOP and the all-client RM scan completed under the read-RM lock.
+     * Detach removes the instance pointers used by fault bottom halves.
+     * Keep the channel objects until every queued fault has drained. */
+    uvm_va_space_detach_all_user_channels(va_space,
+                                          &va_space->import_revoke_channels);
+    uvm_processor_mask_copy(&retained_gpus, &va_space->registered_gpus);
+    uvm_global_gpu_retain(&retained_gpus);
+    uvm_va_space_up_write(va_space);
+
+    uvm_parent_processor_mask_zero(&flushed_parents);
+    for_each_gpu_in_mask(gpu, &retained_gpus) {
+        uvm_parent_gpu_t *parent = gpu->parent;
+        NV_STATUS gpu_status = NV_OK;
+
+        if (!uvm_parent_processor_mask_test_and_set(&flushed_parents,
+                                                     parent->id)) {
+            if (parent->isr.non_replayable_faults.handling)
+                gpu_status = uvm_parent_gpu_non_replayable_buffer_flush_checked(parent);
+            if (parent->access_counters_supported)
+                uvm_parent_gpu_access_counter_buffer_flush(parent);
+            uvm_parent_gpu_flush_bottom_halves(parent);
+        }
+
+        if (parent->isr.replayable_faults.handling) {
+            NV_STATUS replay_status = uvm_gpu_replayable_buffer_flush(gpu);
+            if (gpu_status == NV_OK)
+                gpu_status = replay_status;
+        }
+        if (status == NV_OK)
+            status = gpu_status;
+        uvm_parent_gpu_flush_bottom_halves(parent);
+    }
+
+    if (status == NV_OK)
+        status = uvm_global_get_status();
+
+    /* The detached channels are exclusively owned by this list. Fault
+     * workers cannot add new tracker entries after lookup removal and flush. */
+    if (status == NV_OK) {
+        list_for_each_entry(object, &va_space->import_revoke_channels, list_node) {
+            if (object->type != UVM_DEFERRED_FREE_OBJECT_TYPE_CHANNEL) {
+                status = NV_ERR_INVALID_STATE;
+                break;
+            }
+            channel = container_of(object, uvm_user_channel_t, deferred_free);
+            status = uvm_tracker_wait(&channel->clear_faulted_tracker);
+            if (status != NV_OK)
+                break;
+        }
+    }
+
+    uvm_global_gpu_release(&retained_gpus);
+    if (status != NV_OK)
+        goto failed;
+
+    status = uvm_deferred_free_object_list(&va_space->import_revoke_channels);
+    /* A normal unregister may have detached a channel into its own list
+     * between RM STOP and our writer lock. Its tracker and RM handle must
+     * finish before this import can lose its GPU PTEs. */
+    wait_event(va_space->detached_channel_waitq,
+               atomic_read(&va_space->detached_channel_count) == 0);
+    if (status == NV_OK)
+        status = atomic_read(&va_space->detached_channel_error);
+    if (status != NV_OK)
+        goto failed;
+    goto out;
+
+failed:
+    /* Keep any detached channel and its RM handle alive on uncertain fault
+     * completion. The caller retains the import pin and its map. */
+    atomic_set(&va_space->user_fault_quiesce_failed, 1);
+out:
+    uvm_mutex_unlock(&va_space->import_revoke_lock);
+    return status;
 }
 
 void uvm_va_space_stop_all_user_channels(uvm_va_space_t *va_space)
 {
+#if defined(NV_SUNOS)
+    NV_STATUS status = uvm_va_space_stop_all_user_channels_status(
+        va_space, va_space->user_channel_stops_are_immediate);
+
+    if (status != NV_OK)
+        UVM_ERR_PRINT("Stopping all user channels failed: %s\n",
+                      nvstatusToString(status));
+#else
     uvm_gpu_va_space_t *gpu_va_space;
     uvm_user_channel_t *user_channel;
 
-    // Skip if all channels have been already stopped.
     if (atomic_read(&va_space->user_channels_stopped))
         return;
 
@@ -700,10 +935,8 @@ void uvm_va_space_stop_all_user_channels(uvm_va_space_t *va_space)
             uvm_user_channel_stop(user_channel);
     }
 
-    // Since we're holding the VA space lock in read mode, multiple threads
-    // could set this concurrently. user_channels_stopped never transitions back
-    // to 0 after being set to 1 so that's not a problem.
     atomic_set(&va_space->user_channels_stopped, 1);
+#endif
 }
 
 uvm_gpu_t *uvm_va_space_get_gpu_by_uuid(uvm_va_space_t *va_space, const NvProcessorUuid *gpu_uuid)
@@ -833,6 +1066,13 @@ NV_STATUS uvm_va_space_register_gpu(uvm_va_space_t *va_space,
     }
 
     uvm_va_space_down_write(va_space);
+
+    if (uvm_import_tracking_enabled() &&
+        (atomic_read(&va_space->tracked_imports_blocked) ||
+         uvm_va_space_has_tracked_imports(va_space))) {
+        status = NV_ERR_INVALID_STATE;
+        goto done;
+    }
 
     // Make sure the gpu hasn't been already registered in this va space
     if (uvm_processor_mask_test(&va_space->registered_gpus, gpu->id)) {
@@ -1041,6 +1281,8 @@ done:
 
 NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcessorUuid *gpu_uuid)
 {
+    NV_STATUS drain_status;
+    NV_STATUS stop_status = NV_OK;
     uvm_gpu_t *gpu;
     uvm_gpu_va_space_t *gpu_va_space;
     struct mm_struct *mm;
@@ -1055,8 +1297,21 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     // or unregister operations.
     uvm_va_space_down_write(va_space);
 
+    /* Hold publication closed across the read-lock gap below. */
+    if (uvm_import_tracking_enabled() &&
+        (atomic_read(&va_space->detached_channel_error) != NV_OK ||
+         atomic_read(&va_space->tracked_imports_blocked) ||
+         uvm_va_space_has_tracked_imports(va_space))) {
+        uvm_va_space_up_write(va_space);
+        return NV_ERR_INVALID_STATE;
+    }
+    if (uvm_import_tracking_enabled())
+        atomic_set(&va_space->tracked_imports_blocked, 1);
+
     gpu = uvm_va_space_get_gpu_by_uuid(va_space, gpu_uuid);
     if (!gpu) {
+        if (uvm_import_tracking_enabled())
+            atomic_set(&va_space->tracked_imports_blocked, 0);
         uvm_va_space_up_write(va_space);
         return NV_ERR_INVALID_DEVICE;
     }
@@ -1067,6 +1322,8 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     // - GPU VA space register
     // - GPU unregister (which would allow new GPU registers)
     if (uvm_processor_mask_test(&va_space->gpu_unregister_in_progress, gpu->id)) {
+        if (uvm_import_tracking_enabled())
+            atomic_set(&va_space->tracked_imports_blocked, 0);
         uvm_va_space_up_write(va_space);
         return NV_ERR_INVALID_DEVICE;
     }
@@ -1091,7 +1348,17 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
 
     gpu_va_space = uvm_gpu_va_space_get(va_space, gpu);
     if (gpu_va_space)
-        gpu_va_space_stop_all_channels(gpu_va_space);
+        stop_status = gpu_va_space_stop_all_channels(gpu_va_space);
+
+    if (stop_status != NV_OK) {
+        uvm_va_space_up_read_rm(va_space);
+        uvm_va_space_down_write(va_space);
+        uvm_processor_mask_clear(&va_space->gpu_unregister_in_progress, gpu->id);
+        if (uvm_import_tracking_enabled())
+            atomic_set(&va_space->tracked_imports_blocked, 0);
+        uvm_va_space_up_write(va_space);
+        return stop_status;
+    }
 
     // We need to drop the lock to re-take it in write mode. We don't have to
     // retain the GPU because we've prevented other threads from unregistering
@@ -1130,6 +1397,9 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     UVM_ASSERT(uvm_processor_mask_test(&va_space->gpu_unregister_in_progress, gpu->id));
     uvm_processor_mask_clear(&va_space->gpu_unregister_in_progress, gpu->id);
 
+    if (uvm_import_tracking_enabled())
+        atomic_set(&va_space->tracked_imports_blocked, 0);
+
     uvm_va_space_up_write(va_space);
 
     // Unlock the mm since the call to uvm_deferred_free_object_list() requires
@@ -1139,7 +1409,7 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
     if (mm)
         uvm_up_read_mmap_lock(mm);
 
-    uvm_deferred_free_object_list(&deferred_free_list);
+    drain_status = uvm_deferred_free_object_list(&deferred_free_list);
 
     // Release the VA space's GPU and peer counts
     uvm_mutex_lock(&g_uvm_global.global_lock);
@@ -1162,7 +1432,7 @@ NV_STATUS uvm_va_space_unregister_gpu(uvm_va_space_t *va_space, const NvProcesso
 
     uvm_va_space_mm_or_current_release(va_space, mm);
 
-    return NV_OK;
+    return drain_status;
 }
 
 static void disable_egm_peers(uvm_va_space_t *va_space, uvm_gpu_t *gpu0, uvm_gpu_t *gpu1)
@@ -1296,6 +1566,10 @@ static NV_STATUS enable_peers(uvm_va_space_t *va_space, uvm_gpu_t *gpu0, uvm_gpu
     LIST_HEAD(deferred_free_list);
 
     uvm_assert_rwsem_locked_write(&va_space->lock);
+
+    /* A rollback would otherwise destroy tracked maps under the VA writer. */
+    if (uvm_va_space_has_tracked_imports(va_space))
+        return NV_ERR_INVALID_STATE;
 
     // We know the GPUs were retained already, so now verify that they've been
     // registered by this specific VA space.
@@ -1512,21 +1786,16 @@ static NV_STATUS uvm_gpu_va_space_set_page_dir(uvm_gpu_va_space_t *gpu_va_space)
     return status;
 }
 
+#include "uvm_va_space_unset_checked_impl.h"
+
 void uvm_gpu_va_space_unset_page_dir(uvm_gpu_va_space_t *gpu_va_space)
 {
-    if (uvm_gpu_va_space_state(gpu_va_space) != UVM_GPU_VA_SPACE_STATE_INIT)
-        uvm_assert_rwsem_locked_read(&gpu_va_space->va_space->lock);
+    NV_STATUS status = uvm_gpu_va_space_unset_page_dir_ordinary(gpu_va_space);
 
-    if (gpu_va_space->did_set_page_directory) {
-        NV_STATUS status;
-
-        status = uvm_rm_locked_call(nvUvmInterfaceUnsetPageDirectory(gpu_va_space->duped_gpu_va_space));
-        UVM_ASSERT_MSG(status == NV_OK,
-                       "nvUvmInterfaceUnsetPageDirectory() failed: %s, GPU %s\n",
-                       nvstatusToString(status),
-                       uvm_gpu_name(gpu_va_space->gpu));
-        gpu_va_space->did_set_page_directory = false;
-    }
+    UVM_ASSERT_MSG(status == NV_OK,
+                   "nvUvmInterfaceUnsetPageDirectory() failed: %s, GPU %s\n",
+                   nvstatusToString(status),
+                   uvm_gpu_name(gpu_va_space->gpu));
 }
 
 static void destroy_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space)
@@ -1712,6 +1981,11 @@ static NV_STATUS check_gpu_va_space(uvm_gpu_va_space_t *gpu_va_space)
     // The VA space's mm is being torn down, so don't allow more work
     if (va_space->disallow_new_registers)
         return NV_ERR_PAGE_TABLE_NOT_AVAIL;
+
+    // A callback may have permanently revoked the existing GPU VA spaces.
+    // Do not publish a new one after the revoke loop has taken its snapshot.
+    if (atomic_read(&va_space->user_channels_revoking))
+        return NV_ERR_INVALID_STATE;
 
     if (!va_space->pageable.cdmm_enabled) {
         // In NUMA mode, the new GPU VA space must have the same ATS setting as
@@ -1911,7 +2185,11 @@ NV_STATUS uvm_va_space_unregister_gpu_va_space(uvm_va_space_t *va_space, const N
     gpu_va_space = uvm_gpu_va_space_get(va_space, gpu);
     UVM_ASSERT(gpu_va_space);
 
-    gpu_va_space_stop_all_channels(gpu_va_space);
+    status = gpu_va_space_stop_all_channels(gpu_va_space);
+    if (status != NV_OK) {
+        uvm_va_space_up_read_rm(va_space);
+        return status;
+    }
 
     // We need to drop the lock to re-take it in write mode
     uvm_gpu_va_space_retain(gpu_va_space);
@@ -1932,7 +2210,10 @@ NV_STATUS uvm_va_space_unregister_gpu_va_space(uvm_va_space_t *va_space, const N
         UVM_ASSERT(gpu == uvm_va_space_get_gpu_by_uuid_with_gpu_va_space(va_space, gpu_uuid));
         UVM_ASSERT(gpu_va_space == uvm_gpu_va_space_get(va_space, gpu));
 
-        remove_gpu_va_space(gpu_va_space, mm, &deferred_free_list);
+        if (uvm_va_space_has_tracked_imports(va_space))
+            status = NV_ERR_INVALID_STATE;
+        else
+            remove_gpu_va_space(gpu_va_space, mm, &deferred_free_list);
     }
 
     uvm_va_space_up_write(va_space);
@@ -1944,7 +2225,11 @@ NV_STATUS uvm_va_space_unregister_gpu_va_space(uvm_va_space_t *va_space, const N
     if (mm)
         uvm_up_read_mmap_lock(mm);
 
-    uvm_deferred_free_object_list(&deferred_free_list);
+    {
+        NV_STATUS drain_status = uvm_deferred_free_object_list(&deferred_free_list);
+        if (status == NV_OK)
+            status = drain_status;
+    }
     uvm_gpu_va_space_release(gpu_va_space);
     uvm_gpu_release(gpu);
 
@@ -2038,51 +2323,100 @@ typedef struct
     uvm_parent_processor_mask_t replayable;
     uvm_parent_processor_mask_t non_replayable;
     uvm_parent_processor_mask_t access_counters;
+#if defined(NV_SUNOS)
+    NV_STATUS status;
+#endif
 } flushed_gpus_t;
 
-static void uvm_deferred_free_object_channel(uvm_deferred_free_object_t *object, flushed_gpus_t *flushed_gpus)
+static NV_STATUS uvm_deferred_free_object_channel(uvm_deferred_free_object_t *object,
+                                                  flushed_gpus_t *flushed_gpus)
 {
     uvm_user_channel_t *channel = container_of(object, uvm_user_channel_t, deferred_free);
     uvm_gpu_t *gpu = channel->gpu;
+#if defined(NV_SUNOS)
+    NV_STATUS status;
+#endif
 
     // Flush this instance pointer out of the buffers. This prevents us from re-
     // allocating the same instance pointer for a new channel and mis-
     // attributing old notifications to it.
 
     // All channels can generate non-replayable faults, so all must flush
+#if defined(NV_SUNOS)
+    if (!uvm_parent_processor_mask_test_and_set(&flushed_gpus->non_replayable, gpu->parent->id)) {
+        if (gpu->parent->isr.non_replayable_faults.handling)
+            status = uvm_parent_gpu_non_replayable_buffer_flush_checked(gpu->parent);
+        else if (gpu->parent->isr.non_replayable_faults.was_handling)
+            status = NV_ERR_INVALID_STATE;
+        else
+            status = NV_OK; /* This GPU never registered that fault source. */
+        if (flushed_gpus->status == NV_OK)
+            flushed_gpus->status = status;
+    }
+#else
     if (!uvm_parent_processor_mask_test_and_set(&flushed_gpus->non_replayable, gpu->parent->id))
         uvm_parent_gpu_non_replayable_buffer_flush(gpu->parent);
+#endif
 
     // Only the GR engine can generate replayable faults and access counter
     // notifications
     if (channel->engine_type == UVM_GPU_CHANNEL_ENGINE_TYPE_GR) {
+#if defined(NV_SUNOS)
+        if (!uvm_parent_processor_mask_test_and_set(&flushed_gpus->replayable, gpu->parent->id)) {
+            if (gpu->parent->isr.replayable_faults.handling)
+                status = uvm_gpu_replayable_buffer_flush(gpu);
+            else if (gpu->parent->isr.replayable_faults.was_handling)
+                status = NV_ERR_INVALID_STATE;
+            else
+                status = NV_OK;
+            if (flushed_gpus->status == NV_OK)
+                flushed_gpus->status = status;
+        }
+#else
         if (!uvm_parent_processor_mask_test_and_set(&flushed_gpus->replayable, gpu->parent->id))
             uvm_gpu_replayable_buffer_flush(gpu);
+#endif
 
         if (gpu->parent->access_counters_supported &&
             !uvm_parent_processor_mask_test_and_set(&flushed_gpus->access_counters, gpu->parent->id))
             uvm_parent_gpu_access_counter_buffer_flush(gpu->parent);
     }
 
-    uvm_user_channel_destroy_detached(channel);
+#if defined(NV_SUNOS)
+    status = uvm_global_get_status();
+    if (flushed_gpus->status == NV_OK)
+        flushed_gpus->status = status;
+    channel->deferred_flush_status = flushed_gpus->status;
+    return uvm_user_channel_destroy_detached(channel);
+#else
+    return uvm_user_channel_destroy_detached(channel);
+#endif
 }
 
-void uvm_deferred_free_object_list(struct list_head *deferred_free_list)
+NV_STATUS uvm_deferred_free_object_list(struct list_head *deferred_free_list)
 {
     uvm_deferred_free_object_t *object, *next;
     flushed_gpus_t flushed_gpus;
+    NV_STATUS status = NV_OK;
 
     uvm_parent_processor_mask_zero(&flushed_gpus.replayable);
     uvm_parent_processor_mask_zero(&flushed_gpus.non_replayable);
     uvm_parent_processor_mask_zero(&flushed_gpus.access_counters);
+#if defined(NV_SUNOS)
+    flushed_gpus.status = NV_OK;
+#endif
 
     list_for_each_entry_safe(object, next, deferred_free_list, list_node) {
         list_del(&object->list_node);
 
         switch (object->type) {
             case UVM_DEFERRED_FREE_OBJECT_TYPE_CHANNEL:
-                uvm_deferred_free_object_channel(object, &flushed_gpus);
+            {
+                NV_STATUS channel_status = uvm_deferred_free_object_channel(object, &flushed_gpus);
+                if (status == NV_OK)
+                    status = channel_status;
                 break;
+            }
             case UVM_DEFERRED_FREE_OBJECT_GPU_VA_SPACE:
                 destroy_gpu_va_space(container_of(object, uvm_gpu_va_space_t, deferred_free));
                 break;
@@ -2100,6 +2434,7 @@ void uvm_deferred_free_object_list(struct list_head *deferred_free_list)
                 UVM_ASSERT_MSG(0, "Invalid type %d\n", object->type);
         }
     }
+    return status;
 }
 
 uvm_user_channel_t *uvm_gpu_va_space_get_user_channel(uvm_gpu_va_space_t *gpu_va_space,
@@ -2166,6 +2501,11 @@ NV_STATUS uvm_api_disable_peer_access(UVM_DISABLE_PEER_ACCESS_PARAMS *params, st
     LIST_HEAD(deferred_free_list);
 
     uvm_va_space_down_write(va_space);
+
+    if (uvm_va_space_has_tracked_imports(va_space)) {
+        status = NV_ERR_INVALID_STATE;
+        goto error;
+    }
 
     gpu0 = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpuUuidA);
     gpu1 = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpuUuidB);
@@ -2265,6 +2605,11 @@ NV_STATUS uvm_test_disable_static_peer_access(UVM_TEST_DISABLE_STATIC_PEER_ACCES
     LIST_HEAD(deferred_free_list);
 
     uvm_va_space_down_write(va_space);
+
+    if (uvm_va_space_has_tracked_imports(va_space)) {
+        status = NV_ERR_INVALID_STATE;
+        goto error;
+    }
 
     gpu0 = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpuUuidA);
     gpu1 = uvm_va_space_get_gpu_by_uuid(va_space, &params->gpuUuidB);

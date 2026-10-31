@@ -60,6 +60,15 @@ NVSwitch settings use the Linux parameter names `NvSwitchRegDwords` and
 Confidential Computing is not supported, and `RmConfidentialCompute` settings
 are ignored.
 
+## CUDA system-memory cache policy
+
+The `cuda-cache-alias` branch experimentally maps driver-owned RAM requested
+as write-combined with a consistent cached type on illumos. The observed
+cache alias, intermittent stale H2D copies, live tests, and remaining causal
+and performance questions are recorded in the
+[CUDA cache-alias analysis](docs/cuda-h2d-cache-alias.md). This policy has not
+yet been accepted as a general production fix.
+
 ## GPU I2C buses
 
 `nvidia_i2c` registers one controller per GPU with the illumos I2C framework,

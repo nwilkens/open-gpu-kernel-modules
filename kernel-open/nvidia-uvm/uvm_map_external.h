@@ -143,9 +143,32 @@ NV_STATUS uvm_va_range_map_rm_allocation(uvm_va_range_t *va_range,
 //
 // The caller must hold the range tree lock for the mapping gpu and is
 // responsible for making sure that mapping gpu is retained across those calls.
-void uvm_ext_gpu_map_destroy(uvm_va_range_external_t *external_range,
-                             uvm_ext_gpu_map_t *ext_gpu_map,
-                             struct list_head *deferred_free_list);
+NV_STATUS uvm_ext_gpu_map_destroy(uvm_va_range_external_t *external_range,
+                                    uvm_ext_gpu_map_t *ext_gpu_map,
+                                    struct list_head *deferred_free_list);
+
+// Revokes one map fragment and releases its RM duplicate only after the last
+// fragment is gone. On a failed GPU or RM barrier, the map remains in the tree.
+// The caller must hold the VA-space read lock and the GPU range-tree mutex,
+// prevent new submissions, and hold the RM descriptor guard through teardown.
+NV_STATUS uvm_ext_gpu_map_destroy_checked(uvm_va_range_external_t *external_range,
+                                           uvm_ext_gpu_map_t *ext_gpu_map);
+
+// Revoke all fragments of one duplicate. The caller must keep the VA space,
+// target handle, GPU, and RM descriptor alive throughout this call. A detached
+// deferred fragment or a failed barrier causes a failure result.
+NV_STATUS uvm_ext_gpu_import_revoke_checked(uvm_va_space_t *va_space,
+                                             uvm_ext_gpu_mem_handle *target);
+
+// Caller holds the GPU range-tree mutex. Used by VA writer teardown paths
+// which cannot make RM calls while holding the writer lock.
+bool uvm_ext_gpu_range_has_tracked_import(uvm_va_range_external_t *external_range,
+                                           uvm_gpu_t *gpu);
+
+// A failed checked barrier may quarantine an import after the file closes.
+// Keep the module loaded while any owner callback or guard handoff remains.
+int uvm_ext_gpu_import_busy(void);
+NV_STATUS uvm_va_space_revoke_tracked_imports_checked(uvm_va_space_t *va_space);
 
 // Deferred free function which frees the RM handle and the object itself.
 void uvm_ext_gpu_map_free(uvm_ext_gpu_map_t *ext_gpu_map);
