@@ -22,9 +22,11 @@
 
 #include "nv_uvm_interface.h"
 #include "uvm_common.h"
+#include "uvm_global.h"
 #include "uvm_api.h"
 #include "uvm_gpu_non_replayable_faults.h"
 #include "uvm_gpu.h"
+#include "uvm_gpu_isr.h"
 #include "uvm_hal.h"
 #include "uvm_lock.h"
 #include "uvm_tools.h"
@@ -158,20 +160,49 @@ void uvm_parent_gpu_fault_buffer_deinit_non_replayable_faults(uvm_parent_gpu_t *
     non_replayable_faults->fault_cache        = NULL;
 }
 
+#include "uvm_gpu_non_replayable_pending_checked_impl.h"
+
 bool uvm_parent_gpu_non_replayable_faults_pending(uvm_parent_gpu_t *parent_gpu)
 {
+#if defined(NV_SUNOS)
+    bool pending = false;
+    NV_STATUS status = uvm_parent_gpu_non_replayable_faults_pending_checked(parent_gpu, &pending);
+
+    UVM_ASSERT(status == NV_OK);
+    return pending;
+#else
     NV_STATUS status;
     NvBool has_pending_faults;
 
     UVM_ASSERT(parent_gpu->isr.non_replayable_faults.handling);
-
-    // RM requires the caller to serialize calls on the same GPU
     uvm_assert_spinlock_locked(&parent_gpu->isr.interrupts_lock);
 
-    status = nvUvmInterfaceHasPendingNonReplayableFaults(&parent_gpu->fault_buffer.rm_info, &has_pending_faults);
+    status = nvUvmInterfaceHasPendingNonReplayableFaults(&parent_gpu->fault_buffer.rm_info,
+                                                         &has_pending_faults);
     UVM_ASSERT(status == NV_OK);
-
     return has_pending_faults == NV_TRUE;
+#endif
+}
+
+NV_STATUS uvm_parent_gpu_non_replayable_buffer_flush_checked(uvm_parent_gpu_t *parent_gpu)
+{
+    NV_STATUS status;
+    unsigned scheduled;
+
+    uvm_spin_lock_irqsave(&parent_gpu->isr.interrupts_lock);
+    if (parent_gpu->isr.is_suspended || !parent_gpu->isr.non_replayable_faults.handling)
+        status = NV_ERR_INVALID_STATE;
+    else
+        status = uvm_parent_gpu_schedule_non_replayable_faults_handler_checked(parent_gpu, &scheduled);
+    uvm_spin_unlock_irqrestore(&parent_gpu->isr.interrupts_lock);
+    if (status != NV_OK)
+        return status;
+
+    /* Even if nothing was newly scheduled, an earlier bottom half may be
+     * servicing the channel. Its queue must finish before ID reuse. */
+    (void)scheduled;
+    nv_kthread_q_flush(&parent_gpu->isr.bottom_half_q);
+    return uvm_global_get_status();
 }
 
 void uvm_parent_gpu_non_replayable_buffer_flush(uvm_parent_gpu_t *parent_gpu)

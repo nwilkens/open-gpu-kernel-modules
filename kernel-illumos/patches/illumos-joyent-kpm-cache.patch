@@ -1,0 +1,168 @@
+From 8dcf80d15d8e1f1b7742cb336bf5de5edf46a0ba Mon Sep 17 00:00:00 2001
+From: neirac <cneira@edgecast.io>
+Date: Mon, 2 Nov 2026 14:29:09 -0300
+Subject: [PATCH] x86 hat: preserve existing PTE bits in KPM cache transitions
+
+---
+ .../hat_kpm_cache/test_source_contract.py     | 36 ++++++++++
+ usr/src/uts/i86pc/vm/hat_i86.c                | 66 +++++++++++++++++++
+ usr/src/uts/i86pc/vm/hat_i86.h                |  2 +
+ 3 files changed, 104 insertions(+)
+ create mode 100644 usr/src/test/os-tests/tests/hat_kpm_cache/test_source_contract.py
+
+diff --git a/usr/src/test/os-tests/tests/hat_kpm_cache/test_source_contract.py b/usr/src/test/os-tests/tests/hat_kpm_cache/test_source_contract.py
+new file mode 100644
+index 0000000000..21524a6999
+--- /dev/null
++++ b/usr/src/test/os-tests/tests/hat_kpm_cache/test_source_contract.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# CDDL HEADER END
++# Copyright 2026 Edgecast Cloud LLC.
++
++"""Regression guard for the KPM cache update that panicked on PT_GLOBAL."""
++
++from pathlib import Path
++import re
++import unittest
++
++
++SOURCE = Path(__file__).resolve().parents[4] / "uts/i86pc/vm/hat_i86.c"
++
++
++class KpmCacheContract(unittest.TestCase):
++    def test_updates_only_cache_bits_of_existing_pte(self):
++        source = SOURCE.read_text()
++        match = re.search(r"\nhat_kpm_set_cache\(.*?\n}\n", source, re.S)
++        self.assertIsNotNone(match, "HAT KPM cache update is missing")
++        body = match.group()
++        self.assertIn("x86pte_update(", body)
++        self.assertIn("PT_WRITETHRU", body)
++        self.assertIn("PT_NOCACHE", body)
++        self.assertIn("PT_PAT_4K", body)
++        self.assertNotIn("hat_devload(", body)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/usr/src/uts/i86pc/vm/hat_i86.c b/usr/src/uts/i86pc/vm/hat_i86.c
+index ce9280d164..5be05a4772 100644
+--- a/usr/src/uts/i86pc/vm/hat_i86.c
++++ b/usr/src/uts/i86pc/vm/hat_i86.c
+@@ -31,6 +31,7 @@
+  * Copyright (c) 2014, 2015 by Delphix. All rights reserved.
+  * Copyright 2022 Tintri by DDN, Inc. All rights reserved.
+  * Copyright 2026 Oxide Computer Company
++ * Copyright 2026 Edgecast Cloud LLC.
+  */
+ 
+ /*
+@@ -272,6 +273,7 @@
+ #include <vm/seg_spt.h>
+ 
+ #include <sys/cmn_err.h>
++#include <sys/errno.h>
+ 
+ /*
+  * Basic parameters for hat operation.
+@@ -4813,6 +4815,70 @@ hat_kpm_pfn2va(pfn_t pfn)
+ 	return ((caddr_t)vaddr);
+ }
+ 
++/*
++ * Change only the cache policy of an existing 4K KPM mapping.  Rebuilding
++ * the PTE through hat_devload() also changes unrelated bits (in particular
++ * PT_GLOBAL with KPTI enabled), and may panic after installing that PTE.
++ * The caller must quiesce users of the page and flush CPU caches before and
++ * after the transition.  Large KPM mappings require page-table demotion and
++ * are deliberately rejected here.
++ */
++int
++hat_kpm_set_cache(pfn_t pfn, uint_t expected, uint_t desired)
++{
++#ifdef __xpv
++	(void) pfn;
++	(void) expected;
++	(void) desired;
++	return (ENOTSUP);
++#else
++	htable_t *ht;
++	caddr_t va;
++	x86pte_t old, new, found;
++	x86pte_t mask = PT_WRITETHRU | PT_NOCACHE | PT_PAT_4K;
++	x86pte_t from, to;
++	uint_t entry;
++	int error = 0;
++
++	if ((expected != HAT_STORECACHING_OK &&
++	    expected != HAT_MERGING_OK) ||
++	    (desired != HAT_STORECACHING_OK && desired != HAT_MERGING_OK))
++		return (EINVAL);
++	if (!kpm_enable || kpm_vbase == NULL || pfn_is_foreign(pfn))
++		return (ENOTSUP);
++
++	from = hati_mkpte(pfn, PROT_READ | PROT_WRITE | expected, 0,
++	    HAT_LOAD_NOCONSIST) & mask;
++	to = hati_mkpte(pfn, PROT_READ | PROT_WRITE | desired, 0,
++	    HAT_LOAD_NOCONSIST) & mask;
++	va = hat_kpm_pfn2va(pfn);
++	ht = htable_getpte(kas.a_hat, (uintptr_t)va, &entry, &old, 0);
++	if (ht == NULL)
++		return (hat_getpagesize(kas.a_hat, va) > MMU_PAGESIZE ?
++		    ENOTSUP : ENOENT);
++
++	for (;;) {
++		if (!PTE_ISVALID(old)) {
++			error = ENOENT;
++			break;
++		}
++		if (PTE2PFN(old, 0) != pfn || (old & mask) != from) {
++			error = EBUSY;
++			break;
++		}
++		if (from == to)
++			break;
++		new = (old & ~mask) | to;
++		found = x86pte_update(ht, entry, old, new);
++		if (found == old)
++			break;
++		old = found;
++	}
++	htable_release(ht);
++	return (error);
++#endif
++}
++
+ /*
+  * Return the kpm virtual address for the page at pp.
+  */
+diff --git a/usr/src/uts/i86pc/vm/hat_i86.h b/usr/src/uts/i86pc/vm/hat_i86.h
+index 16ad6aca33..cae5e9a3b2 100644
+--- a/usr/src/uts/i86pc/vm/hat_i86.h
++++ b/usr/src/uts/i86pc/vm/hat_i86.h
+@@ -25,6 +25,7 @@
+ /*
+  * Copyright (c) 2014 by Delphix. All rights reserved.
+  * Copyright 2018 Joyent, Inc.
++ * Copyright 2026 Edgecast Cloud LLC.
+  */
+ 
+ #ifndef	_VM_HAT_I86_H
+@@ -251,6 +252,7 @@ extern void hat_pte_unmap(htable_t *ht, uint_t entry, uint_t flags,
+ 	x86pte_t old_pte, void *pte_ptr, boolean_t tlb);
+ extern void hat_init_finish(void);
+ extern caddr_t hat_kpm_pfn2va(pfn_t pfn);
++extern int hat_kpm_set_cache(pfn_t, uint_t expected, uint_t desired);
+ extern pfn_t hat_kpm_va2pfn(caddr_t);
+ extern page_t *hat_kpm_vaddr2page(caddr_t);
+ extern uintptr_t hat_kernelbase(uintptr_t);
+-- 
+2.53.0
+

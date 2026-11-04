@@ -32,9 +32,11 @@
  */
 
 #include "nv-illumos.h"
+#include "nv-console-range.h"
 #include "nv-reg.h"
 
 #include <sys/pci_cap.h>
+#include <sys/framebuffer.h>
 
 const NvBool nv_is_rm_firmware_supported_os = NV_TRUE;
 
@@ -316,12 +318,13 @@ static void
 nv_console_attach(nv_illumos_state_t *nvis)
 {
     gfxp_fb_softc_ptr_t fb;
-
     if (!nv_is_boot_console(NV_STATE_PTR(nvis)))
         return;
 
     /* The GPU is already openable, so publish the softc only once ready. */
     fb = gfxp_fb_softc_alloc();
+    if (fb == NULL)
+        return;
     if (gfxp_fb_attach(nvis->dip, DDI_ATTACH, fb) != DDI_SUCCESS)
     {
         gfxp_fb_softc_free(fb);
@@ -833,6 +836,9 @@ _init(void)
     nv_i2c_interface_init();
     nv_intr_init();
     nv_pm_init();
+    rc = nv_umem_init();
+    if (rc != 0)
+        goto fail_umem;
 
     if (nv_uvm_init() != 0)
     {
@@ -856,6 +862,8 @@ _init(void)
 fail_uvm:
     nv_uvm_exit();
 fail:
+    nv_umem_fini();
+fail_umem:
     nv_pm_fini();
     nv_intr_fini();
     nv_i2c_interface_fini();
@@ -873,6 +881,9 @@ _fini(void)
 {
     int rc;
 
+    if (nv_umem_busy())
+        return (EBUSY);
+
     rc = mod_remove(&nvidia_modlinkage);
     if (rc != 0)
         return (rc);
@@ -883,6 +894,7 @@ _fini(void)
 
     nv_clone_fini();
     nv_uvm_exit();
+    nv_umem_fini();
     nv_pm_fini();
     nv_intr_fini();
     nv_i2c_interface_fini();

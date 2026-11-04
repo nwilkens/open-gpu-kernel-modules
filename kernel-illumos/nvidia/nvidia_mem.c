@@ -1,5 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 1999-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Edgecast Cloud LLC.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -40,6 +41,10 @@
 
 #include <sys/vmem.h>
 #include <sys/vmsystm.h>
+#include <sys/cpuvar.h>
+#include <sys/disp.h>
+#include <sys/x_call.h>
+#include <sys/x86_archext.h>
 #include <sys/gfx_private.h>
 #include <sys/ddi_impldefs.h>
 #include <sys/pci_impl.h>
@@ -48,6 +53,11 @@
 #include <vm/seg.h>
 #include <vm/seg_kmem.h>
 #include <vm/page.h>
+
+/* Private x86 HAT interfaces from the matching illumos kernel. */
+extern caddr_t hat_kpm_pfn2va(pfn_t);
+extern int hat_kpm_prepare_cache(pfn_t);
+extern int hat_kpm_set_cache(pfn_t, uint_t, uint_t);
 
 NvU32 nv_dma_remap_peer_mmio = NV_DMA_REMAP_PEER_MMIO_ENABLE;
 
@@ -237,10 +247,130 @@ nvos_free_alloc(nv_illumos_alloc_t *at)
     kmem_free(at, sizeof (*at));
 }
 
+/* Read with mdb before and after an isolated CUDA workload. */
+volatile uint64_t nv_kpm_wc_remap_allocs;
+volatile uint64_t nv_kpm_wc_remap_pages;
+volatile uint64_t nv_kpm_wc_restore_allocs;
+volatile uint64_t nv_kpm_wc_skip_large;
+volatile uint64_t nv_kpm_wc_skip_missing;
+volatile uint64_t nv_kpm_wc_skip_pfn;
+
+static int
+nv_kpm_wc_flush_cpu(xc_arg_t unused1, xc_arg_t unused2, xc_arg_t unused3)
+{
+    (void)unused1;
+    (void)unused2;
+    (void)unused3;
+    os_flush_cpu_write_combine_buffer();
+    invalidate_cache();
+    return 0;
+}
+
 static void
+nv_kpm_wc_flush_all(void)
+{
+    ulong_t set[CPUSET_WORDS];
+    size_t i;
+
+    for (i = 0; i < CPUSET_WORDS; i++)
+        set[i] = ~0UL;
+    kpreempt_disable();
+    xc_sync(0, 0, 0, set, nv_kpm_wc_flush_cpu);
+    kpreempt_enable();
+}
+
+/* Prepare 4 KiB KPM leaves before changing driver-owned WC pages. */
+static NvBool
+nv_kpm_wc_preflight(nv_illumos_alloc_t *at)
+{
+    NvU32 i;
+
+    for (i = 0; i < at->num_pages; i++)
+    {
+        pfn_t pfn = mmu_btop(at->page_table[i].phys_addr);
+        caddr_t va = hat_kpm_pfn2va(pfn);
+        int error = hat_kpm_prepare_cache(pfn);
+        ssize_t pagesize = hat_getpagesize(kas.a_hat, va);
+
+        if (error != 0 || pagesize != MMU_PAGESIZE)
+        {
+            if (pagesize > MMU_PAGESIZE)
+                atomic_inc_64(&nv_kpm_wc_skip_large);
+            else
+                atomic_inc_64(&nv_kpm_wc_skip_missing);
+            return NV_FALSE;
+        }
+        if (hat_getpfnum(kas.a_hat, va) != pfn)
+        {
+            atomic_inc_64(&nv_kpm_wc_skip_pfn);
+            return NV_FALSE;
+        }
+    }
+    return NV_TRUE;
+}
+
+static NvBool
+nv_kpm_wc_set(nv_illumos_alloc_t *at, NvBool wc)
+{
+    uint_t before = wc ? HAT_STORECACHING_OK : HAT_MERGING_OK;
+    uint_t after = wc ? HAT_MERGING_OK : HAT_STORECACHING_OK;
+    NvU32 i;
+
+    for (i = 0; i < at->num_pages; i++)
+    {
+        pfn_t pfn = mmu_btop(at->page_table[i].phys_addr);
+        int error = hat_kpm_set_cache(pfn, before, after);
+
+        if (error != 0)
+        {
+            nv_printf(NV_DBG_ERRORS,
+                "NVRM: KPM cache transition failed for PFN %lx: %d\n",
+                (ulong_t)pfn, error);
+            while (i != 0)
+            {
+                int rollback_error;
+
+                i--;
+                pfn = mmu_btop(at->page_table[i].phys_addr);
+                rollback_error = hat_kpm_set_cache(pfn, after, before);
+                if (rollback_error != 0)
+                {
+                    at->flags.kpm_quarantine = NV_TRUE;
+                    nv_printf(NV_DBG_ERRORS,
+                        "NVRM: KPM rollback failed for allocation %p PFN %lx: %d\n",
+                        (void *)at, (ulong_t)pfn, rollback_error);
+                }
+            }
+            nv_kpm_wc_flush_all();
+            return NV_FALSE;
+        }
+    }
+    nv_kpm_wc_flush_all();
+    return NV_TRUE;
+}
+
+static NvBool
 nv_free_dma_chunks(nv_illumos_alloc_t *at)
 {
     NvU32 i;
+
+    if (at->flags.kpm_quarantine)
+        return NV_FALSE;
+
+    if (at->flags.kpm_wc)
+    {
+        nv_kpm_wc_flush_all();
+        if (!nv_kpm_wc_set(at, NV_FALSE))
+        {
+            at->flags.kpm_quarantine = NV_TRUE;
+            nv_printf(NV_DBG_ERRORS,
+                "NVRM: quarantining DMA allocation %p after KPM restore failure\n",
+                (void *)at);
+            return NV_FALSE;
+        }
+        at->flags.kpm_wc = NV_FALSE;
+        atomic_inc_64(&nv_kpm_wc_restore_allocs);
+    }
 
     if (at->kva != NULL && at->num_chunks > 1)
         nv_kunmap_phys(at->kva, at->num_pages);
@@ -260,6 +390,7 @@ nv_free_dma_chunks(nv_illumos_alloc_t *at)
         kmem_free(at->chunks, at->num_chunks * sizeof (nv_dma_chunk_t));
     at->chunks = NULL;
     at->num_chunks = 0;
+    return NV_TRUE;
 }
 
 /*
@@ -334,7 +465,8 @@ nv_alloc_dma_chunks(nv_state_t *nv, nv_illumos_alloc_t *at, NvU64 chunk_size)
 
         c->len = (size_t)len;
 
-        if (at->flags.zeroed)
+        if (at->flags.zeroed &&
+            at->cache_type != NV_MEMORY_WRITECOMBINED)
             bzero(c->kva, c->len);
 
         for (off = 0; off < len; off += MMU_PAGESIZE, page++)
@@ -342,6 +474,32 @@ nv_alloc_dma_chunks(nv_state_t *nv, nv_illumos_alloc_t *at, NvU64 chunk_size)
             at->page_table[page].virt_addr = c->kva + off;
             at->page_table[page].phys_addr = nv_kva_to_phys(c->kva + off);
         }
+    }
+
+    if (at->cache_type == NV_MEMORY_WRITECOMBINED)
+    {
+        NvBool remap = nv_kpm_wc_preflight(at);
+
+        if (remap)
+        {
+            nv_kpm_wc_flush_all();
+            remap = nv_kpm_wc_set(at, NV_TRUE);
+            if (remap)
+            {
+                at->flags.kpm_wc = NV_TRUE;
+                atomic_inc_64(&nv_kpm_wc_remap_allocs);
+                atomic_add_64(&nv_kpm_wc_remap_pages, at->num_pages);
+            }
+        }
+        if (at->flags.zeroed)
+        {
+            for (i = 0; i < nchunks; i++)
+                bzero(at->chunks[i].kva, at->chunks[i].len);
+        }
+        if (at->flags.kpm_quarantine)
+            goto fail;
+        if (remap)
+            os_flush_cpu_write_combine_buffer();
     }
 
     if (nchunks == 1)
@@ -367,7 +525,8 @@ nv_alloc_dma_chunks(nv_state_t *nv, nv_illumos_alloc_t *at, NvU64 chunk_size)
     return NV_OK;
 
 fail:
-    nv_free_dma_chunks(at);
+    if (!nv_free_dma_chunks(at))
+        return NV_ERR_INVALID_STATE;
     return NV_ERR_NO_MEMORY;
 }
 
@@ -378,7 +537,10 @@ nv_alloc_destroy(nv_illumos_alloc_t *at)
         gfxp_umem_cookie_destroy(at->umem_cookie);
 
     if (at->num_chunks != 0)
-        nv_free_dma_chunks(at);
+    {
+        if (!nv_free_dma_chunks(at))
+            return;
+    }
     else if (at->kva != NULL)
         nv_kunmap_phys(at->kva, at->num_pages);
 
@@ -444,7 +606,8 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
     status = nv_alloc_dma_chunks(nv, at, contiguous ? at->size : page_size);
     if (status != NV_OK)
     {
-        nvos_free_alloc(at);
+        if (!at->flags.kpm_quarantine)
+            nvos_free_alloc(at);
         return status;
     }
 

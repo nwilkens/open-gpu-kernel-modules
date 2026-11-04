@@ -135,8 +135,54 @@ uvm_file_finish(void *arg)
 static void
 uvm_file_release(struct linux_file *f)
 {
+    boolean_t queue_finish = B_FALSE;
+
     uvm_stack_call(uvm_file_release_stk, f);
-    uvm_after_deferred_release(uvm_file_finish, f);
+
+    mutex_enter(&f->f_lock);
+    f->f_release_called = B_TRUE;
+    if ((!f->f_finish_deferred || f->f_finish_ready) &&
+        !f->f_finish_queued) {
+        f->f_finish_queued = B_TRUE;
+        queue_finish = B_TRUE;
+    }
+    mutex_exit(&f->f_lock);
+
+    if (queue_finish)
+        uvm_after_deferred_release(uvm_file_finish, f);
+}
+
+/*
+ * A VA space retained for a checked import or a failed channel stop outlives
+ * its final file count. Keep the zero-count file and its accounting owner
+ * until VA-space destruction completes. This release baton is not an f_count
+ * hold, so it does not prevent normal VA-space release from starting.
+ */
+void
+uvm_illumos_defer_file_finish(struct linux_file *f)
+{
+    mutex_enter(&f->f_lock);
+    VERIFY(!f->f_finish_queued);
+    f->f_finish_deferred = B_TRUE;
+    mutex_exit(&f->f_lock);
+}
+
+void
+uvm_illumos_finish_deferred_file(struct linux_file *f)
+{
+    boolean_t queue_finish = B_FALSE;
+
+    mutex_enter(&f->f_lock);
+    VERIFY(f->f_finish_deferred);
+    f->f_finish_ready = B_TRUE;
+    if (f->f_release_called && !f->f_finish_queued) {
+        f->f_finish_queued = B_TRUE;
+        queue_finish = B_TRUE;
+    }
+    mutex_exit(&f->f_lock);
+
+    if (queue_finish)
+        uvm_after_deferred_release(uvm_file_finish, f);
 }
 
 void
@@ -760,9 +806,11 @@ int
 _fini(void)
 {
     int rc;
+    extern int uvm_ext_gpu_import_busy(void);
 
     /* Files and segments call into this module; suspend holds UVM locks. */
     if (uvm_file_live != 0 || uvm_seg_count() != 0 || uvm_pin_busy() ||
+        uvm_ext_gpu_import_busy() ||
         uvm_pm_is_suspended())
         return (EBUSY);
 

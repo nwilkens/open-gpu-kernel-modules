@@ -299,6 +299,9 @@ struct KernelChannel {
     NvBool bGspOwned;
     NvBool bUvmOwned;
     NvBool bIsContextBound;
+#if defined(NV_SUNOS)
+    volatile NvU32 uvmRevoked;
+#endif
     FIFO_INSTANCE_BLOCK *pFifoHalData[8];
     MEMORY_DESCRIPTOR *pInstSubDeviceMemDesc[8];
     MEMORY_DESCRIPTOR *pUserdSubDeviceMemDesc[8];

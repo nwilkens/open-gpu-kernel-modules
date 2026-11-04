@@ -483,6 +483,9 @@ gvaspaceConstruct__IMPL
 
     // Save off flags.
     pGVAS->flags = flags;
+#if defined(NV_SUNOS)
+    pGVAS->uvmRevoked = 0;
+#endif
 
     if (flags & VASPACE_FLAGS_ENABLE_FAULTING)
     {

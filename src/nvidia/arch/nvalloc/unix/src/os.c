@@ -4034,6 +4034,67 @@ osIovaMap
  * @param[in]   pIovaMapping    IOVA mapping info
  *
  */
+#include "os_iova_checked_impl.h"
+
+NV_STATUS
+osIovaUnmapChecked
+(
+    PIOVAMAPPING pIovaMapping
+)
+{
+    OBJGPU *pGpu;
+    nv_state_t *nv;
+    NvU64 osPageCount;
+    NV_STATUS status;
+
+    if (pIovaMapping == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    pGpu = gpumgrGetGpuFromId(pIovaMapping->iovaspaceId);
+    if (pGpu == NULL ||
+        memdescIsCarveoutMemory(pIovaMapping->pPhysMemDesc) ||
+        memdescGetFlag(pIovaMapping->pPhysMemDesc, MEMDESC_FLAGS_GUEST_ALLOCATED) ||
+        memdescGetFlag(pIovaMapping->pPhysMemDesc, MEMDESC_FLAGS_PEER_IO_MEM) ||
+        pIovaMapping->pOsData == NULL)
+        return NV_ERR_NOT_SUPPORTED;
+
+    nv = NV_GET_NV_STATE(pGpu);
+    if (skipIovaMappingForTegra(pIovaMapping, nv))
+        return NV_ERR_NOT_SUPPORTED;
+
+    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+    {
+        osPageCount = pIovaMapping->pPhysMemDesc->PageCount;
+        NV_ASSERT_OR_RETURN(os_page_size ==
+                            pIovaMapping->pPhysMemDesc->pageArrayGranularity,
+                            NV_ERR_INVALID_STATE);
+    }
+    else
+    {
+        osPageCount = NV_RM_PAGES_TO_OS_PAGES(pIovaMapping->pPhysMemDesc->PageCount);
+    }
+
+    if (!IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc) &&
+        NV_RM_PAGE_SIZE < os_page_size &&
+        !memdescGetContiguity(pIovaMapping->pPhysMemDesc, AT_CPU))
+    {
+        RmDeflateRmToOsPageArray(&pIovaMapping->iovaArray[0],
+                                  pIovaMapping->pPhysMemDesc->PageCount);
+    }
+
+    status = osIovaUnmapAllocationChecked(pIovaMapping, nv->dma_dev, osPageCount);
+
+    if (!IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc) &&
+        NV_RM_PAGE_SIZE < os_page_size &&
+        !memdescGetContiguity(pIovaMapping->pPhysMemDesc, AT_CPU))
+    {
+        RmInflateOsToRmPageArray(&pIovaMapping->iovaArray[0],
+                                  pIovaMapping->pPhysMemDesc->PageCount);
+    }
+
+    return status;
+}
+
 void
 osIovaUnmap
 (

@@ -124,6 +124,28 @@ NV_STATUS NV_API_CALL rm_gpu_ops_address_space_destroy(nvidia_stack_t *sp,
     return NV_OK;
 }
 
+NV_STATUS NV_API_CALL rm_gpu_ops_revoke_address_space(nvidia_stack_t *sp,
+    gpuAddressSpaceHandle vaspace)
+{
+    NV_STATUS status;
+    void *fp;
+    NV_ENTER_RM_RUNTIME(sp,fp);
+    status = nvGpuOpsRevokeAddressSpace(vaspace);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+    return status;
+}
+
+NV_STATUS NV_API_CALL rm_gpu_ops_verify_vaspace_channels_revoked(nvidia_stack_t *sp,
+    gpuAddressSpaceHandle vaspace)
+{
+    NV_STATUS status;
+    void *fp;
+    NV_ENTER_RM_RUNTIME(sp,fp);
+    status = nvGpuOpsVerifyVaSpaceChannelsRevoked(vaspace);
+    NV_EXIT_RM_RUNTIME(sp,fp);
+    return status;
+}
+
 NV_STATUS  NV_API_CALL  rm_gpu_ops_memory_alloc_fb(
     nvidia_stack_t *sp, gpuAddressSpaceHandle vaspace,
     NvLength size, NvU64 *gpuOffset, gpuAllocInfo *allocInfo)
@@ -435,6 +457,25 @@ NV_STATUS  NV_API_CALL  rm_gpu_ops_dup_memory (nvidia_stack_t *sp,
     return rmStatus;
 }
 
+NV_STATUS NV_API_CALL rm_gpu_ops_dup_memory_tracked(nvidia_stack_t *sp,
+                                                    gpuDeviceHandle device,
+                                                    NvHandle hClient,
+                                                    NvHandle hPhysMemory,
+                                                    NvHandle *hDupMemory,
+                                                    nvgpuMemoryInfo_t gpuMemoryInfo,
+                                                    void **ppImportToken)
+{
+    NV_STATUS rmStatus;
+    void *fp;
+
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    rmStatus = nvGpuOpsDupMemoryTracked(device, hClient, hPhysMemory,
+                                       hDupMemory, gpuMemoryInfo,
+                                       ppImportToken);
+    NV_EXIT_RM_RUNTIME(sp, fp);
+    return rmStatus;
+}
+
 NV_STATUS  NV_API_CALL  rm_gpu_ops_free_duped_handle (nvidia_stack_t *sp,
                                                 gpuDeviceHandle device,
                                                 NvHandle hPhysHandle)
@@ -444,6 +485,34 @@ NV_STATUS  NV_API_CALL  rm_gpu_ops_free_duped_handle (nvidia_stack_t *sp,
     NV_ENTER_RM_RUNTIME(sp,fp);
     rmStatus = nvGpuOpsFreeDupedHandle(device, hPhysHandle);
     NV_EXIT_RM_RUNTIME(sp,fp);
+    return rmStatus;
+}
+
+NV_STATUS NV_API_CALL rm_gpu_ops_free_duped_handle_checked(nvidia_stack_t *sp,
+                                                            gpuDeviceHandle device,
+                                                            NvHandle hPhysHandle,
+                                                            NvBool *pIovaReleased)
+{
+    NV_STATUS rmStatus;
+    void *fp;
+
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    rmStatus = nvGpuOpsFreeDupedHandleChecked(device, hPhysHandle,
+                                              pIovaReleased);
+    NV_EXIT_RM_RUNTIME(sp, fp);
+    return rmStatus;
+}
+
+NV_STATUS NV_API_CALL rm_gpu_ops_release_import_guard(nvidia_stack_t *sp,
+                                                      gpuDeviceHandle device,
+                                                      void *importToken)
+{
+    NV_STATUS rmStatus;
+    void *fp;
+
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    rmStatus = nvGpuOpsReleaseImportGuard(device, importToken);
+    NV_EXIT_RM_RUNTIME(sp, fp);
     return rmStatus;
 }
 
@@ -806,15 +875,28 @@ rm_gpu_ops_release_channel(nvidia_stack_t *sp, void *retainedChannel)
     NV_EXIT_RM_RUNTIME(sp, fp);
 }
 
-void NV_API_CALL
+NV_STATUS NV_API_CALL
 rm_gpu_ops_stop_channel(nvidia_stack_t * sp,
                         void *retainedChannel,
                         NvBool bImmediate)
 {
     void *fp;
+    NV_STATUS status;
     NV_ENTER_RM_RUNTIME(sp,fp);
-    nvGpuOpsStopChannel(retainedChannel, bImmediate);
+    status = nvGpuOpsStopChannel(retainedChannel, bImmediate);
     NV_EXIT_RM_RUNTIME(sp, fp);
+    return status;
+}
+
+NV_STATUS NV_API_CALL
+rm_gpu_ops_revoke_channel(nvidia_stack_t *sp, void *retainedChannel)
+{
+    void *fp;
+    NV_STATUS status;
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    status = nvGpuOpsRevokeChannel(retainedChannel);
+    NV_EXIT_RM_RUNTIME(sp, fp);
+    return status;
 }
 
 NV_STATUS  NV_API_CALL

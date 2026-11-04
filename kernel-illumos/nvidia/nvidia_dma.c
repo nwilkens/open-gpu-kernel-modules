@@ -203,33 +203,7 @@ NV_STATUS NV_API_CALL nv_dma_map_alloc(
     return NV_OK;
 }
 
-NV_STATUS NV_API_CALL nv_dma_unmap_alloc(
-    nv_dma_device_t *dma_dev,
-    NvU64            page_count,
-    NvU64           *va_array,
-    void           **priv
-)
-{
-    nv_dma_map_t *map;
-
-    if (priv == NULL || *priv == NULL)
-        return NV_ERR_NOT_SUPPORTED;
-
-    map = *priv;
-
-    if (map->handle != NULL)
-    {
-        (void) ddi_dma_unbind_handle(map->handle);
-        ddi_dma_free_handle(&map->handle);
-    }
-
-    if (map->own_kva)
-        nv_kunmap_phys(map->kva, map->page_count);
-
-    kmem_free(map, sizeof (*map));
-    *priv = NULL;
-    return NV_OK;
-}
+#include "nvidia_dma_unmap_impl.h"
 
 /*
  * MMIO mappings for peer-to-peer.  With remapping enabled the range is bound

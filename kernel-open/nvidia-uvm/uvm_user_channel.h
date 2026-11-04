@@ -193,6 +193,9 @@ struct uvm_user_channel_struct
     // Node for the deferred free list where this channel is stored upon being
     // detached.
     uvm_deferred_free_object_t deferred_free;
+    /* Set at detach until deferred cleanup reports completion to its VA. */
+    uvm_va_space_t *detach_va_space;
+    NV_STATUS deferred_flush_status;
 
     // Reference count for this user channel. This only protects the memory
     // object itself, for use in cases when user channel needs to be accessed
@@ -256,6 +259,9 @@ void uvm_user_channel_release(uvm_user_channel_t *user_channel);
 //
 // LOCKING: The owning VA space must be locked in read mode, not write mode.
 void uvm_user_channel_stop(uvm_user_channel_t *user_channel);
+NV_STATUS uvm_user_channel_stop_checked(uvm_user_channel_t *user_channel);
+NV_STATUS uvm_user_channel_stop_mode_checked(uvm_user_channel_t *user_channel, bool immediate);
+NV_STATUS uvm_user_channel_revoke_checked(uvm_user_channel_t *user_channel);
 
 // Second phase of user channel destroy which detaches the channel from the
 // parent gpu_va_space and adds it to the list of pending objects to be freed.
@@ -278,7 +284,7 @@ void uvm_user_channel_detach(uvm_user_channel_t *user_channel, struct list_head 
 // have been detached first.
 //
 // LOCKING: No lock is required, but the owning GPU must be retained.
-void uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel);
+NV_STATUS uvm_user_channel_destroy_detached(uvm_user_channel_t *user_channel);
 
 NV_STATUS uvm_test_check_channel_va_space(UVM_TEST_CHECK_CHANNEL_VA_SPACE_PARAMS *params, struct file *filp);
 NV_STATUS uvm_test_dead_channel(UVM_TEST_DEAD_CHANNEL_PARAMS *params, struct file *filp);

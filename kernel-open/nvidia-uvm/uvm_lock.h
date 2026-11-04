@@ -157,6 +157,12 @@
 //      Order: UVM_LOCK_ORDER_VA_SPACES_LIST
 //      Mutex which protects g_uvm_global.va_spaces state.
 //
+// - VA space import fault revoke lock
+//      Order: UVM_LOCK_ORDER_VA_SPACE_IMPORT_REVOKE
+//      Serializes channel lookup removal and fault drain for checked import
+//      callbacks. It precedes global, ISR and VA-space locks: the drain
+//      releases the VA-space lock while waiting for fault workers.
+//
 // - VA space writer serialization lock (va_space->serialize_writers_lock)
 //      Order: UVM_LOCK_ORDER_VA_SPACE_SERIALIZE_WRITERS
 //      Exclusive lock (mutex) per uvm_va_space (UVM struct file)
@@ -522,6 +528,7 @@ typedef enum
 {
     UVM_LOCK_ORDER_INVALID = 0,
     UVM_LOCK_ORDER_GLOBAL_PM,
+    UVM_LOCK_ORDER_VA_SPACE_IMPORT_REVOKE,
     UVM_LOCK_ORDER_GLOBAL,
     UVM_LOCK_ORDER_ACCESS_COUNTERS,
     UVM_LOCK_ORDER_ISR,

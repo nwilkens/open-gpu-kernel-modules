@@ -3,13 +3,19 @@
 
 import argparse
 import re
+import shlex
 import subprocess
 import sys
 
 
-def mdb(command):
+def mdb(command, host=None):
+    argv = ["mdb", "-k", "-e", command]
+    if host is not None:
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                "-o", "HostKeyAlias=saruman.local", host,
+                "mdb -k -e " + shlex.quote(command)]
     return subprocess.run(
-        ["mdb", "-k", "-e", command], check=True, capture_output=True,
+        argv, check=True, capture_output=True,
         text=True).stdout
 
 
@@ -42,9 +48,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu-bdf", type=lambda value: int(value, 16),
                         help="attached GPU BDF as hexadecimal, e.g. 0100")
+    parser.add_argument("--ssh", help="run MDB through SSH on this host")
     args = parser.parse_args()
     try:
-        count = inspect(mdb, args.gpu_bdf)
+        count = inspect(lambda command: mdb(command, args.ssh), args.gpu_bdf)
     except (ValueError, subprocess.CalledProcessError) as error:
         print(error, file=sys.stderr)
         return 1

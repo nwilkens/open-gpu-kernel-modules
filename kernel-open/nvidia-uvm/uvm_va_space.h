@@ -78,7 +78,7 @@ static void uvm_deferred_free_object_add(struct list_head *list,
 // type.
 //
 // LOCKING: May take the GPU isr_lock and the RM locks.
-void uvm_deferred_free_object_list(struct list_head *deferred_free_list);
+NV_STATUS uvm_deferred_free_object_list(struct list_head *deferred_free_list);
 
 typedef enum
 {
@@ -195,10 +195,28 @@ struct uvm_va_space_struct
     // Semaphore protecting the state of the va space
     uvm_rw_semaphore_t lock;
 
+    // Tracks imported OS descriptors independently of external-map trees.
+    // A normal unmap can detach a map before its RM duplicate is freed, so
+    // VA-space release must not use a tree scan as its completion gate.
+    atomic_t import_owner_count;
+    // Owners remain discoverable after a map fragment leaves its range tree.
+    struct list_head import_owners;
+    /* Detached channels awaiting a checked fault drain during import revoke. */
+    struct list_head import_revoke_channels;
+    uvm_spinlock_t import_owner_lock;
+    atomic_t tracked_imports_blocked;
+    atomic_t import_release_pending;
+    struct file *import_release_file;
+
+    // Dedicated queue item for resuming a file release quarantined by a
+    // tracked import. The ordinary deferred-release item may still be active.
+    nv_kthread_q_item_t import_resume_release_q_item;
+
     // Lock taken prior to taking the VA space lock in write mode, or prior to
     // taking the VA space lock in read mode on a path which will call in RM.
     // See UVM_LOCK_ORDER_VA_SPACE_SERIALIZE_WRITERS in uvm_lock.h.
     uvm_mutex_t serialize_writers_lock;
+    uvm_mutex_t import_revoke_lock;
 
     // Lock taken to serialize down_reads on the VA space lock with up_writes in
     // other threads. See
@@ -358,6 +376,18 @@ struct uvm_va_space_struct
     // is an atomic_t because multiple threads may call
     // uvm_va_space_stop_all_user_channels concurrently.
     atomic_t user_channels_stopped;
+    /* Set before callback-side revocation; never cleared for this VA space. */
+    atomic_t user_channels_revoking;
+    /* Set only after every registered channel passes checked RM revocation. */
+    atomic_t user_channels_revoked;
+    /* A failed drain must fail closed for every import in this VA space. */
+    atomic_t user_fault_quiesce_failed;
+    /* Includes channels detached by ordinary unregister in the lock gap. */
+    atomic_t detached_channel_count;
+    atomic_t detached_channel_error;
+    wait_queue_head_t detached_channel_waitq;
+    /* Protects the final wakeup from racing the last VA-space free. */
+    uvm_mutex_t detached_channel_completion_lock;
 
     // Prevent future registrations of any kind (GPU, GPU VA space, channel).
     // This is used when the associated va_space_mm is torn down, which has to
@@ -433,6 +463,18 @@ struct uvm_va_space_struct
     // Queue item for deferred f_ops->release() handling
     nv_kthread_q_item_t deferred_release_q_item;
 };
+
+static inline bool uvm_va_space_has_tracked_imports(uvm_va_space_t *va_space)
+{
+    return atomic_read(&va_space->import_owner_count) != 0;
+}
+
+void uvm_va_space_resume_import_release(uvm_va_space_t *va_space);
+
+#if defined(NV_SUNOS)
+void uvm_illumos_defer_file_finish(struct file *filp);
+void uvm_illumos_finish_deferred_file(struct file *filp);
+#endif
 
 NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va_space_ptr, NvU64 flags);
 void uvm_va_space_destroy(uvm_va_space_t *va_space);
@@ -561,6 +603,15 @@ bool uvm_va_space_single_gpu_in_parent(uvm_va_space_t *va_space, uvm_parent_gpu_
 // LOCKING: The VA space lock must be held in read mode, not write.
 void uvm_va_space_stop_all_user_channels(uvm_va_space_t *va_space);
 
+// Stop all user channels in non-immediate mode and report the first RM
+// failure. A failure leaves user_channels_stopped unset. A successful stop
+// alone does not prevent a user thread from requeueing a channel; the caller
+// must separately prevent new submissions and registrations.
+// LOCKING: The VA space lock must be held in read mode, not write.
+NV_STATUS uvm_va_space_stop_all_user_channels_checked(uvm_va_space_t *va_space);
+NV_STATUS uvm_va_space_revoke_all_user_channels_checked(uvm_va_space_t *va_space);
+NV_STATUS uvm_va_space_quiesce_user_faults_checked(uvm_va_space_t *va_space);
+
 // Calls uvm_user_channel_detach on all user channels in a VA space.
 //
 // The detached channels are added to the input list. The caller is expected to
@@ -645,6 +696,7 @@ void uvm_gpu_va_space_release(uvm_gpu_va_space_t *gpu_va_space);
 
 // Wrapper for nvUvmInterfaceUnsetPageDirectory
 void uvm_gpu_va_space_unset_page_dir(uvm_gpu_va_space_t *gpu_va_space);
+NV_STATUS uvm_gpu_va_space_unset_page_dir_checked(uvm_gpu_va_space_t *gpu_va_space);
 
 static uvm_gpu_va_space_state_t uvm_gpu_va_space_state(uvm_gpu_va_space_t *gpu_va_space)
 {

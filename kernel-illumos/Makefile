@@ -221,8 +221,10 @@ NVIDIA_UVM_DEPS := -Ndrv/nvidia
 NVIDIA_UVM_KOPEN_CFLAGS := $(NVIDIA_UVM_CFLAGS) -Wno-unused-but-set-variable \
                            -include uvm_illumos_kpi.h
 
+# The kernel-open headers can define functions included by unchanged sources.
+# Track them so incremental builds do not retain stale UVM objects.
 NVIDIA_UVM_HDRS := $(wildcard nvidia-uvm/*.h nvidia-uvm/lkpi/*.h \
-                   nvidia-uvm/lkpi/*/*.h common/inc/*.h)
+                   nvidia-uvm/lkpi/*/*.h common/inc/*.h $(KOPEN_UVM)/*.h)
 
 $(OUTPUTDIR)/nvidia-uvm/%.o: nvidia-uvm/%.c $(NVIDIA_UVM_HDRS)
 	@mkdir -p $(dir $@)

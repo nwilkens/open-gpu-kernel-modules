@@ -118,17 +118,23 @@ static unsigned schedule_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
     return 1;
 }
 
-unsigned uvm_parent_gpu_schedule_non_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
+NV_STATUS uvm_parent_gpu_schedule_non_replayable_faults_handler_checked(uvm_parent_gpu_t *parent_gpu,
+                                                                        unsigned *scheduled_out)
 {
-    bool scheduled;
+    bool scheduled, pending;
+    NV_STATUS status;
+
+    *scheduled_out = 0;
 
     if (parent_gpu->isr.is_suspended)
-        return 0;
+        return NV_OK;
 
     // handling gets set to false for all handlers during removal, so quit if
     // the GPU is in the process of being removed.
     if (!parent_gpu->isr.non_replayable_faults.handling)
-        return 0;
+        return NV_OK;
+    if (atomic_read(&parent_gpu->isr.bottom_half_q.main_loop_should_exit))
+        return NV_ERR_INVALID_STATE;
 
     // Non-replayable_faults are stored in a synchronized circular queue
     // shared by RM/UVM. Therefore, we can query the number of pending
@@ -137,8 +143,9 @@ unsigned uvm_parent_gpu_schedule_non_replayable_faults_handler(uvm_parent_gpu_t 
     // interrupts will be triggered by the gpu and faults may stay
     // unserviced. Therefore, if there is a fault in the queue, we schedule
     // a bottom half unconditionally.
-    if (!uvm_parent_gpu_non_replayable_faults_pending(parent_gpu))
-        return 0;
+    status = uvm_parent_gpu_non_replayable_faults_pending_checked(parent_gpu, &pending);
+    if (status != NV_OK || !pending)
+        return status;
 
     nv_kref_get(&parent_gpu->gpu_kref);
 
@@ -151,7 +158,36 @@ unsigned uvm_parent_gpu_schedule_non_replayable_faults_handler(uvm_parent_gpu_t 
     if (!scheduled)
         uvm_parent_gpu_kref_put(parent_gpu);
 
+    *scheduled_out = 1;
+    return NV_OK;
+}
+
+unsigned uvm_parent_gpu_schedule_non_replayable_faults_handler(uvm_parent_gpu_t *parent_gpu)
+{
+#if defined(NV_SUNOS)
+    unsigned scheduled = 0;
+    NV_STATUS status = uvm_parent_gpu_schedule_non_replayable_faults_handler_checked(parent_gpu,
+                                                                                      &scheduled);
+
+    UVM_ASSERT(status == NV_OK);
+    return scheduled;
+#else
+    bool scheduled;
+
+    if (parent_gpu->isr.is_suspended || !parent_gpu->isr.non_replayable_faults.handling)
+        return 0;
+
+    if (!uvm_parent_gpu_non_replayable_faults_pending(parent_gpu))
+        return 0;
+
+    nv_kref_get(&parent_gpu->gpu_kref);
+    scheduled = nv_kthread_q_schedule_q_item(&parent_gpu->isr.bottom_half_q,
+                                             &parent_gpu->isr.non_replayable_faults.bottom_half_q_item) != 0;
+    if (!scheduled)
+        uvm_parent_gpu_kref_put(parent_gpu);
+
     return 1;
+#endif
 }
 
 static unsigned schedule_access_counters_handler(uvm_parent_gpu_t *parent_gpu, NvU32 notif_buf_index)

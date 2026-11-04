@@ -266,8 +266,8 @@ NvBool NV_API_CALL nv_is_chassis_notebook(void)
 }
 
 /*
- * RM keeps a boot console working only when it starts at the FB BAR base or
- * 16 MB into the IMEM BAR (RmSetConsolePreservationParams).
+ * RM keeps a boot console working within the FB BAR or at 16 MB into the
+ * IMEM BAR (RmSetConsolePreservationParams).
  */
 NvBool
 nv_is_boot_console(nv_state_t *nv)
@@ -283,11 +283,11 @@ nv_is_boot_console(nv_state_t *nv)
     return (nv_console_range_fits(
             nv->bars[NV_GPU_BAR_INDEX_FB].cpu_address,
             nv->bars[NV_GPU_BAR_INDEX_FB].size, fb_info.paddr,
-            fb_info.fb_size, 0) ||
+            fb_info.fb_size, 0, 0) ||
         nv_console_range_fits(
             nv->bars[NV_GPU_BAR_INDEX_IMEM].cpu_address,
             nv->bars[NV_GPU_BAR_INDEX_IMEM].size, fb_info.paddr,
-            fb_info.fb_size, 0x1000000));
+            fb_info.fb_size, 0x1000000, 1));
 }
 
 /*

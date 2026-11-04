@@ -27,6 +27,9 @@
 #include "uvm_forward_decl.h"
 
 bool uvm_parent_gpu_non_replayable_faults_pending(uvm_parent_gpu_t *parent_gpu);
+NV_STATUS uvm_parent_gpu_non_replayable_faults_pending_checked(uvm_parent_gpu_t *parent_gpu,
+                                                               bool *pending);
+NV_STATUS uvm_parent_gpu_non_replayable_buffer_flush_checked(uvm_parent_gpu_t *parent_gpu);
 
 // Flush the non-replayable shadow buffer (see the comment at the top of
 // uvm_gpu_non_replayable_faults.c for an explanation of the shadow buffer).

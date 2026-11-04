@@ -1297,6 +1297,8 @@ serverFreeResourceTree
             callContext.pServer = pServer;
             callContext.pClient = pClient;
             callContext.pLockInfo = pLockInfo;
+            if (pParams->pSecInfo != NULL)
+                callContext.secInfo = *pParams->pSecInfo;
 
             it = clientRefIter(pClient, NULL, 0, RS_ITERATE_DESCENDANTS, NV_TRUE);
             while (clientRefIterNext(pClient, &it))
